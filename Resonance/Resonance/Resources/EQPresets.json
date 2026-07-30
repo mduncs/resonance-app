@@ -1,0 +1,84 @@
+{
+  "presets": [
+    {
+      "id": "flat",
+      "name": "Flat",
+      "bands": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "id": "bass_boost",
+      "name": "Bass Boost",
+      "bands": [6, 5, 4, 2, 0, 0, 0, 0, 0, 0]
+    },
+    {
+      "id": "treble_boost",
+      "name": "Treble Boost",
+      "bands": [0, 0, 0, 0, 0, 2, 4, 5, 6, 6]
+    },
+    {
+      "id": "vocal_boost",
+      "name": "Vocal Boost",
+      "bands": [-2, -1, 0, 3, 5, 5, 3, 0, -1, -2]
+    },
+    {
+      "id": "electronic",
+      "name": "Electronic",
+      "bands": [5, 4, 1, 0, -2, 2, 1, 2, 4, 5]
+    },
+    {
+      "id": "rock",
+      "name": "Rock",
+      "bands": [5, 4, 2, 0, -1, 0, 2, 3, 4, 5]
+    },
+    {
+      "id": "jazz",
+      "name": "Jazz",
+      "bands": [3, 2, 1, 2, -2, -2, 0, 2, 3, 4]
+    },
+    {
+      "id": "classical",
+      "name": "Classical",
+      "bands": [4, 3, 2, 1, -1, -1, 0, 2, 3, 4]
+    },
+    {
+      "id": "acoustic",
+      "name": "Acoustic",
+      "bands": [4, 3, 1, 1, 2, 2, 3, 3, 3, 2]
+    },
+    {
+      "id": "late_night",
+      "name": "Late Night",
+      "description": "Reduces harsh frequencies for comfortable late-night listening",
+      "bands": [4, 3, 0, -2, -1, 1, 2, 3, 3, 3]
+    },
+    {
+      "id": "loudness",
+      "name": "Loudness",
+      "description": "Boosts bass and treble for low-volume listening",
+      "bands": [6, 4, 1, 0, -1, -1, 0, 1, 4, 6]
+    },
+    {
+      "id": "spoken_word",
+      "name": "Spoken Word",
+      "description": "Optimized for podcasts and audiobooks",
+      "bands": [-2, 0, 2, 4, 5, 5, 4, 2, 0, -2]
+    }
+  ],
+  "frequencies": [
+    {"hz": 32, "label": "32"},
+    {"hz": 64, "label": "64"},
+    {"hz": 125, "label": "125"},
+    {"hz": 250, "label": "250"},
+    {"hz": 500, "label": "500"},
+    {"hz": 1000, "label": "1K"},
+    {"hz": 2000, "label": "2K"},
+    {"hz": 4000, "label": "4K"},
+    {"hz": 8000, "label": "8K"},
+    {"hz": 16000, "label": "16K"}
+  ],
+  "bandRange": {
+    "min": -12,
+    "max": 12,
+    "unit": "dB"
+  }
+}

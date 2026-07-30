@@ -1,0 +1,116 @@
+name: Resonance
+options:
+  bundleIdPrefix: com.resonance
+  deploymentTarget:
+    macOS: "14.0"
+  xcodeVersion: "16.0"
+  generateEmptyDirectories: true
+  groupSortPosition: top
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    ENABLE_USER_SCRIPT_SANDBOXING: true
+  configs:
+    Debug:
+      SWIFT_OPTIMIZATION_LEVEL: -Onone
+    Release:
+      SWIFT_OPTIMIZATION_LEVEL: -O
+
+packages:
+  GRDB:
+    url: https://github.com/groue/GRDB.swift.git
+    from: "7.0.0"
+
+targets:
+  Resonance:
+    type: application
+    platform: macOS
+    sources:
+      - path: Resonance
+        excludes:
+          - "**/.DS_Store"
+    dependencies:
+      - package: GRDB
+        product: GRDB
+    settings:
+      base:
+        INFOPLIST_FILE: Resonance/Resources/Info.plist
+        CODE_SIGN_ENTITLEMENTS: Resonance/Resources/Resonance.entitlements
+        PRODUCT_BUNDLE_IDENTIFIER: com.resonance.public
+        PRODUCT_NAME: Resonance Public
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+        DEVELOPMENT_TEAM: ""
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        COMBINE_HIDPI_IMAGES: true
+        ENABLE_HARDENED_RUNTIME: true
+      configs:
+        Debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: DEBUG
+        Release:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: ""
+    entitlements:
+      path: Resonance/Resources/Resonance.entitlements
+    info:
+      path: Resonance/Resources/Info.plist
+      properties:
+        LSApplicationCategoryType: public.app-category.music
+        CFBundleDisplayName: Resonance Public
+        NSHumanReadableCopyright: "Copyright © 2025. All rights reserved."
+  ResonanceTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: ResonanceTests
+    dependencies:
+      - target: Resonance
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        PRODUCT_BUNDLE_IDENTIFIER: com.resonance.public.ResonanceTests
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Resonance Public.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Resonance Public"
+  ResonanceUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: ResonanceUITests
+    dependencies:
+      - target: Resonance
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: true
+        PRODUCT_BUNDLE_IDENTIFIER: com.resonance.public.ResonanceUITests
+        TEST_TARGET_NAME: Resonance
+
+schemes:
+  Resonance:
+    build:
+      targets:
+        Resonance: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - name: ResonanceTests
+        - name: ResonanceUITests
+    profile:
+      config: Release
+    analyze:
+      config: Debug
+    archive:
+      config: Release
+  ResonanceUnitTests:
+    build:
+      targets:
+        Resonance: all
+        ResonanceTests: [test]
+    test:
+      config: Debug
+      targets:
+        - name: ResonanceTests

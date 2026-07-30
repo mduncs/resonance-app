@@ -1,0 +1,40 @@
+# Xcode user data (contains env vars with credentials)
+xcuserdata/
+*.xcuserstate
+
+# Build artifacts
+build/
+DerivedData/
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+*.hmap
+*.ipa
+*.dSYM.zip
+*.dSYM
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+
+# CocoaPods
+Pods/
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# App-specific
+*.log
+
+# Companion service build artifacts
+resonance-mgmt/node_modules/
+resonance-mgmt/resonance-mgmt

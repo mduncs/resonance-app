@@ -1,0 +1,23 @@
+MusicFolder = "/Volumes/External/ResonancePublic/Forty"
+DataFolder = "/Volumes/External/ResonancePublic/NavidromeData"
+CacheFolder = "/Volumes/External/ResonancePublic/NavidromeCache"
+LogFile = "/Volumes/External/ResonancePublic/Logs/navidrome.log"
+
+Address = "127.0.0.1"
+Port = 4534
+LogLevel = "info"
+
+DevAutoCreateAdminPassword = "demo"
+EnableExternalServices = false
+EnableInsightsCollector = false
+EnableSharing = false
+EnableDownloads = false
+EnableUserEditing = false
+EnableArtworkUpload = false
+EnableLogRedacting = true
+
+Scanner.Schedule = "0"
+Scanner.ScanOnStartup = true
+Scanner.WatcherWait = "0"
+Scanner.FollowSymlinks = true
+Scanner.PurgeMissing = "always"

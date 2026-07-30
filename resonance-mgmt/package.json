@@ -1,0 +1,17 @@
+{
+  "name": "resonance-mgmt",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build --compile --outfile resonance-mgmt src/index.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "music-metadata": "^10.6.3"
+  },
+  "devDependencies": {
+    "bun-types": "^1.3.13",
+    "typescript": "^5.7.0"
+  }
+}
