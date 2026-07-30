@@ -171,7 +171,7 @@ final class FetcherAutomakeTests: XCTestCase {
             let items = try database.loadProjectItems(projectId: project.id, serverId: serverId)
             XCTAssertEqual(items.count, 2)
 
-            // Archived by md: automake must not resurrect or touch it.
+            // Archived by the user: automake must not resurrect or touch it.
             try database.archiveProject(id: project.id, serverId: serverId)
             let third = try FetcherProjectAutomake.run(
                 snapshot: snapshot, serverId: serverId, database: database

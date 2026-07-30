@@ -52,7 +52,7 @@ enum ResonanceError: Error, LocalizedError, Sendable {
         case .invalidURL:
             return "Invalid server URL"
         case .publicDemoRequiresLocalServer:
-            return "Resonance Public only connects to its local Forty demo library"
+            return "This showcase build of Resonance only connects to its local demo library"
         case .networkUnavailable:
             return "Network unavailable"
         case .serverUnreachable(let url):

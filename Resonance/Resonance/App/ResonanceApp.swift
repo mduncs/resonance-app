@@ -79,12 +79,12 @@ struct ResonanceApp: App {
             SongCommands(appState: appState)
             CommandGroup(replacing: .help) {
                 Button("Keyboard Shortcuts") {
-                    if let url = URL(string: "https://github.com/mduncs/resonance#keyboard-shortcuts") {
+                    if let url = URL(string: "https://github.com/mduncs/resonance-app#keyboard-shortcuts") {
                         NSWorkspace.shared.open(url)
                     }
                 }
                 Button("Report an Issue...") {
-                    if let url = URL(string: "https://github.com/mduncs/resonance/issues") {
+                    if let url = URL(string: "https://github.com/mduncs/resonance-app/issues") {
                         NSWorkspace.shared.open(url)
                     }
                 }
@@ -98,7 +98,7 @@ struct ResonanceApp: App {
         }
         .windowResizability(.contentSize)
 
-        MenuBarExtra("Resonance Public", systemImage: "music.note", isInserted: $showMenuBarPlayer) {
+        MenuBarExtra("Resonance", systemImage: "music.note", isInserted: $showMenuBarPlayer) {
             MenuBarPlayerView()
                 .environment(appState)
                 .tint(accentColor)

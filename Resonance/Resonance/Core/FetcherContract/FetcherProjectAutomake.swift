@@ -1,21 +1,21 @@
 import CryptoKit
 import Foundation
 
-/// Automatic Project creation from Fetcher source collections (gamdl playlists
-/// and rooms). Runs after a contract snapshot's provenance rows land in GRDB:
+/// Automatic Project creation from Fetcher source collections (playlists and
+/// rooms). Runs after a contract snapshot's provenance rows land in GRDB:
 /// each playlist/room collection that resolves to at least one cached Navidrome
 /// song gets exactly one Project, keyed deterministically on
 /// `serverId + sourceCollectionKey`, so re-running is a free incremental upsert.
 /// Album-kind collections are skipped — albums already have an identity in the
-/// library and do not become Projects (md's call, 2026-07-24).
+/// library and do not become Projects.
 enum FetcherProjectAutomake {
 
     // MARK: - Lineage (pseudo-hierarchy category)
 
     /// Canonical category for a collection's lineage. The contract's top-level
-    /// `domain` is hardcoded `apple_music`; the real lineage (md's own taxonomy:
-    /// Electronic / Dance / Classical / Jazz for playlists, classical / decades /
-    /// dj-mixes for rooms) travels inside `source_specific_json.source_domain`.
+    /// `domain` is hardcoded `apple_music`; the real lineage (the source's own
+    /// taxonomy: Electronic / Dance / Classical / Jazz for playlists, classical /
+    /// decades / dj-mixes for rooms) travels inside `source_specific_json.source_domain`.
     /// Playlist domains arrive capitalized, room domains as lowercase slugs —
     /// both normalize to one title-cased form.
     static func category(for collection: FetcherSourceCollection) -> String {
@@ -111,7 +111,7 @@ enum FetcherProjectAutomake {
     /// One pass over the snapshot's collections. Requires the snapshot's
     /// source-attribution rows to already be upserted (song resolution joins
     /// `source_attribution.navidrome_song_id` to `cached_songs.id`). Never archives,
-    /// renames, or resurrects: a project md archived is skipped outright, and an
+    /// renames, or resurrects: a user-archived project is skipped outright, and an
     /// existing project only ever gains songs (and a category, if it had none).
     static func run(
         snapshot: FetcherContractSnapshot,

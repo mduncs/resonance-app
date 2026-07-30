@@ -40,7 +40,7 @@ targets:
         INFOPLIST_FILE: Resonance/Resources/Info.plist
         CODE_SIGN_ENTITLEMENTS: Resonance/Resources/Resonance.entitlements
         PRODUCT_BUNDLE_IDENTIFIER: com.resonance.public
-        PRODUCT_NAME: Resonance Public
+        PRODUCT_NAME: Resonance
         CODE_SIGN_IDENTITY: "-"
         CODE_SIGN_STYLE: Manual
         DEVELOPMENT_TEAM: ""
@@ -59,7 +59,7 @@ targets:
       path: Resonance/Resources/Info.plist
       properties:
         LSApplicationCategoryType: public.app-category.music
-        CFBundleDisplayName: Resonance Public
+        CFBundleDisplayName: Resonance
         NSHumanReadableCopyright: "Copyright © 2025. All rights reserved."
   ResonanceTests:
     type: bundle.unit-test
@@ -73,7 +73,7 @@ targets:
         GENERATE_INFOPLIST_FILE: true
         PRODUCT_BUNDLE_IDENTIFIER: com.resonance.public.ResonanceTests
         BUNDLE_LOADER: "$(TEST_HOST)"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Resonance Public.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Resonance Public"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Resonance.app/$(BUNDLE_EXECUTABLE_FOLDER_PATH)/Resonance"
   ResonanceUITests:
     type: bundle.ui-testing
     platform: macOS

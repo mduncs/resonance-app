@@ -1,30 +1,24 @@
-# Resonance Public
+# Resonance
 
-Resonance Public is a self-contained showcase build of the Resonance macOS music player. It is intentionally unable to connect to the private Resonance/Navidrome installation.
+Resonance is the music player I wanted for my own library: a native Mac app built around listening, collecting, and deciding what belongs. It is written in Swift and SwiftUI and speaks to a Navidrome server over the Subsonic API.
+
+This branch is the isolated showcase build. It looks and behaves like Resonance, but it talks only to a local demo server on the same Mac and cannot reach anything else.
 
 ## Privacy and isolation
 
-- App identity: `com.resonance.public`
-- Display name: **Resonance Public**
-- Network allowlist: only `http://127.0.0.1:4534`
-- Redirects away from that loopback endpoint are rejected
+- Bundle identifier: `com.resonance.public` (distinct from the private app)
+- Network allowlist: only `http://127.0.0.1:4534`; other hosts, ports, schemes, and redirects are rejected
 - App data: `~/Library/Application Support/Resonance Public`
 - Cache data: `~/Library/Caches/Resonance Public`
 - Keychain service: `com.resonance.public.server`
 - Demo media operations are read-only
-- Navidrome external services and telemetry are disabled
+- No external services or telemetry
 
-The normal Resonance app, its settings, credentials, database, caches, live server, and Fetcher export are not read by this build.
+The normal Resonance app, its settings, credentials, database, caches, live server, and importers are never read by this build.
 
 ## Forty demo library
 
-The showcase library is named **Forty**. Media is not committed to Git and must not be redistributed with the source. On the showcase Mac it lives on the external volume:
-
-```text
-/Volumes/External/ResonancePublic/Forty
-```
-
-That directory contains forty album folders whose tracks are symlinked from complete Apple Music Classical albums already held on the same external volume. The links consume negligible additional storage; the audio remains outside the repository and off the internal SSD.
+The showcase library is named **Forty**. Its media lives outside the repository (on the showcase Mac, under `/Volumes/External/ResonancePublic/Forty`), is not committed to Git, and is not redistributed with the source or with any release build. The downloadable build expects the isolated loopback demo server and does not include the Forty demo music.
 
 ## Run the local demo service
 
@@ -60,7 +54,7 @@ xcodebuild \
   build
 ```
 
-The app bundle is produced as `Resonance Public.app` and can coexist with `Resonance.app`.
+The app bundle is produced as `Resonance.app` with bundle identifier `com.resonance.public`. Install it under a distinct name (for example `Resonance Showcase.app`) if a private `Resonance.app` already exists in `/Applications`.
 
 ## What is included
 

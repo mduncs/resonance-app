@@ -755,275 +755,32 @@ private struct StorageRow: View {
 
 struct ServerSettingsView: View {
     @Environment(AppState.self) private var appState
-    @State private var serverURL = ""
-    @State private var username = ""
-    @State private var password = ""
-    @State private var isTesting = false
-    @State private var isApplying = false
-    @State private var isDisconnecting = false
-    @State private var testResult: TestResult?
 
-    enum TestResult {
-        case success(String)
-        case failure(String)
-    }
-
-    private var canSubmitDraft: Bool {
-        !serverURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !username.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
-        !password.isEmpty
-    }
-
-    private var isBusy: Bool {
-        isTesting || isApplying || isDisconnecting
+    private var connectionDescription: String {
+        switch appState.connectionStatus {
+        case .connected: return "Connected"
+        case .connecting: return "Connecting…"
+        case .disconnected: return "Not connected"
+        case .offline: return "Offline"
+        case .error: return "Unreachable"
+        }
     }
 
     var body: some View {
         Form {
             Section {
-                TextField("Server URL", text: $serverURL)
-                    .textContentType(.URL)
-
-                TextField("Username", text: $username)
-                    .textContentType(.username)
-
-                SecureField("Password", text: $password)
-                    .textContentType(.password)
-
-                HStack {
-                    Button("Test Connection") {
-                        testConnection()
-                    }
-                    .disabled(!canSubmitDraft || isBusy)
-
-                    if isTesting {
-                        ProgressView()
-                    }
-
-                    Button("Save & Apply") {
-                        saveAndApply()
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .disabled(!canSubmitDraft || isBusy)
-
-                    if isApplying {
-                        ProgressView()
-                    }
-
-                    Spacer()
-                }
-                .controlSize(.regular)
-
-                if let result = testResult {
-                    switch result {
-                    case .success(let message):
-                        Label(message, systemImage: "checkmark.circle.fill")
-                            .foregroundStyle(.green)
-                    case .failure(let message):
-                        Label(message, systemImage: "xmark.circle.fill")
-                            .foregroundStyle(.red)
-                    }
-                }
+                LabeledContent("Library", value: appState.currentServer?.name ?? PublicDemoConfiguration.server.name)
+                LabeledContent("Server", value: PublicDemoConfiguration.serverURL.absoluteString)
+                LabeledContent("Status", value: connectionDescription)
             } header: {
-                Text("Navidrome Server")
+                Label("Local Demo Server", systemImage: "lock.fill")
             } footer: {
-                Text("Test Connection uses the values in these fields. Changes are only persisted when you choose Save & Apply.")
+                Text("This showcase build is permanently locked to the bundled demo server on this Mac (127.0.0.1, port 4534). Other servers, hosts, and redirects are rejected, and the server cannot be changed here.")
                     .settingsDescription()
-            }
-
-            if let server = appState.currentServer {
-                Section("Connected Server") {
-                    LabeledContent("Name", value: server.name)
-                    LabeledContent("URL", value: server.url.absoluteString)
-                    LabeledContent("Username", value: server.username)
-
-                    Button("Disconnect", role: .destructive) {
-                        disconnect()
-                    }
-                    .disabled(isBusy)
-
-                    if isDisconnecting {
-                        ProgressView()
-                            .scaleEffect(0.7)
-                    }
-                }
-            } else {
-                Section("Connected Server") {
-                    Text("No server is currently saved.")
-                        .foregroundStyle(.secondary)
-                }
             }
         }
         .formStyle(.grouped)
         .padding()
-        .onAppear {
-            loadCurrentServer()
-        }
-        .onChange(of: serverURL) { _, _ in
-            testResult = nil
-        }
-        .onChange(of: username) { _, _ in
-            testResult = nil
-        }
-        .onChange(of: password) { _, _ in
-            testResult = nil
-        }
-    }
-
-    private func loadCurrentServer() {
-        if let server = appState.currentServer {
-            serverURL = server.url.absoluteString
-            username = server.username
-            password = appState.loadPassword(for: server) ?? ""
-        }
-    }
-
-    private func testConnection() {
-        isTesting = true
-        testResult = nil
-
-        Task {
-            do {
-                let draftServer = try draftServer()
-                _ = try await appState.networkActor.ping(server: draftServer, password: password)
-                await MainActor.run {
-                    testResult = .success("Connection successful")
-                    isTesting = false
-                    appState.showFeedback(
-                        message: "Server connection succeeded",
-                        detail: "The entered server details are valid.",
-                        style: .success,
-                        systemImage: "checkmark.circle.fill"
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    testResult = .failure("Connection failed")
-                    isTesting = false
-                    appState.showFeedback(
-                        message: "Could not reach the server",
-                        detail: feedbackDetail(for: error),
-                        style: .error,
-                        systemImage: "xmark.octagon.fill"
-                    )
-                }
-            }
-        }
-    }
-
-    private func saveAndApply() {
-        isApplying = true
-        testResult = nil
-
-        Task {
-            do {
-                let updatedServer = try await appState.applyServerConfiguration(
-                    urlString: serverURL,
-                    username: username,
-                    password: password
-                )
-
-                await MainActor.run {
-                    serverURL = updatedServer.url.absoluteString
-                    username = updatedServer.username
-                    testResult = .success("Saved and connected")
-                    isApplying = false
-                    appState.showFeedback(
-                        message: "Server settings saved",
-                        detail: "Connected to \(updatedServer.name).",
-                        style: .success,
-                        systemImage: "checkmark.circle.fill"
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    testResult = .failure("Save failed")
-                    isApplying = false
-                    appState.showFeedback(
-                        message: "Could not save server settings",
-                        detail: feedbackDetail(for: error),
-                        style: .error,
-                        systemImage: "xmark.octagon.fill"
-                    )
-                }
-            }
-        }
-    }
-
-    private func disconnect() {
-        isDisconnecting = true
-
-        Task {
-            do {
-                try await appState.disconnectServer()
-                await MainActor.run {
-                    serverURL = ""
-                    username = ""
-                    password = ""
-                    testResult = nil
-                    isDisconnecting = false
-                    appState.showFeedback(
-                        message: "Disconnected from server",
-                        detail: "Saved server details were cleared from this Mac.",
-                        style: .success,
-                        systemImage: "checkmark.circle.fill"
-                    )
-                }
-            } catch {
-                await MainActor.run {
-                    serverURL = ""
-                    username = ""
-                    password = ""
-                    testResult = nil
-                    isDisconnecting = false
-                    appState.showFeedback(
-                        message: "Disconnected with a warning",
-                        detail: feedbackDetail(for: error),
-                        style: .warning,
-                        systemImage: "exclamationmark.triangle.fill"
-                    )
-                }
-            }
-        }
-    }
-
-    private func draftServer() throws -> Server {
-        let trimmedURL = serverURL.trimmingCharacters(in: .whitespacesAndNewlines)
-        let trimmedUsername = username.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        guard let url = URL(string: trimmedURL),
-              let scheme = url.scheme, !scheme.isEmpty,
-              url.host != nil else {
-            throw ResonanceError.invalidURL
-        }
-
-        let existingServer = appState.currentServer ?? appState.servers.first
-        return Server(
-            id: existingServer?.id ?? UUID(),
-            name: existingServer?.name ?? "Navidrome",
-            url: url,
-            username: trimmedUsername
-        )
-    }
-
-    private func feedbackDetail(for error: Error) -> String {
-        if let resonanceError = error as? ResonanceError {
-            let parts = [resonanceError.errorDescription, resonanceError.recoverySuggestion]
-                .compactMap { $0 }
-
-            if parts.isEmpty {
-                return "Try again."
-            }
-
-            return parts.joined(separator: " ")
-        }
-
-        if let localizedError = error as? LocalizedError,
-           let description = localizedError.errorDescription {
-            return description
-        }
-
-        return error.localizedDescription
     }
 }
 
