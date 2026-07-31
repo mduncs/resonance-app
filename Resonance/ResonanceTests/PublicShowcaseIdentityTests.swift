@@ -36,7 +36,7 @@ final class PublicShowcaseIdentityTests: XCTestCase {
             "http://[::1]:4534",
             "http://0.0.0.0:4534",
             "https://demo.navidrome.org",
-            "file:///Volumes/External/ResonancePublic/Forty"
+            "file:///tmp/music"
         ] {
             XCTAssertFalse(
                 PublicDemoConfiguration.allowsNetworkURL(URL(string: rejected)),

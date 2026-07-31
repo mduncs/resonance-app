@@ -1,7 +1,9 @@
-MusicFolder = "/Volumes/External/ResonancePublic/Forty"
-DataFolder = "/Volumes/External/ResonancePublic/NavidromeData"
-CacheFolder = "/Volumes/External/ResonancePublic/NavidromeCache"
-LogFile = "/Volumes/External/ResonancePublic/Logs/navidrome.log"
+# Replace DEMO_ROOT with an absolute path to a folder you control before
+# loading this config. See the README for a one-line substitution.
+MusicFolder = "DEMO_ROOT/Music"
+DataFolder = "DEMO_ROOT/NavidromeData"
+CacheFolder = "DEMO_ROOT/NavidromeCache"
+LogFile = "DEMO_ROOT/Logs/navidrome.log"
 
 Address = "127.0.0.1"
 Port = 4534

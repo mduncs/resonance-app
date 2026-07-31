@@ -3,7 +3,7 @@
 set -u
 
 status_dir="${1:?usage: build-app.sh STATUS_DIRECTORY}"
-derived_data="${RESONANCE_PUBLIC_DERIVED_DATA:-/Volumes/External/ResonancePublic/DerivedData}"
+derived_data="${RESONANCE_PUBLIC_DERIVED_DATA:-$PWD/build/DerivedData}"
 
 /bin/mkdir -p "$status_dir" "$derived_data"
 print -r -- "$$" > "$status_dir/pid"

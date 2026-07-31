@@ -1,6 +1,12 @@
 # Xcode user data (contains env vars with credentials)
 xcuserdata/
+*.xcuserdatad/
 *.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+*.moved-aside
+timeline.xctimeline
+playground.xcworkspace
 
 # Build artifacts
 build/
@@ -20,6 +26,7 @@ DerivedData/
 
 # Swift Package Manager
 .build/
+.swiftpm/
 Packages/
 Package.resolved
 
@@ -34,6 +41,15 @@ Pods/
 
 # App-specific
 *.log
+
+# Secrets and local config (never commit)
+.env
+.env.*
+*.pem
+*.p12
+*.cer
+*.mobileprovision
+*.certSigningRequest
 
 # Companion service build artifacts
 resonance-mgmt/node_modules/

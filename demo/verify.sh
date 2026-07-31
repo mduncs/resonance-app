@@ -3,7 +3,7 @@
 set -u
 
 status_dir="${1:?usage: verify.sh STATUS_DIRECTORY}"
-build_root="${RESONANCE_PUBLIC_BUILD_ROOT:-/Volumes/External/ResonancePublic/BuildCache}"
+build_root="${RESONANCE_PUBLIC_BUILD_ROOT:-$PWD/build/BuildCache}"
 
 /bin/mkdir -p "$status_dir" "$build_root/clang" "$build_root/modules" "$build_root/swiftpm"
 print -r -- "$$" > "$status_dir/pid"

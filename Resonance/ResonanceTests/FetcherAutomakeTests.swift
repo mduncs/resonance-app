@@ -95,13 +95,13 @@ final class FetcherAutomakeTests: XCTestCase {
                 serverId: serverId
             )
             try database.upsertSourceAttributions([
-                attribution(key: "a1", localPath: "/Volumes/External/MusicLibrary/Electronic/Hypnotic/one.flac",
+                attribution(key: "a1", localPath: "/music/Electronic/Hypnotic/one.flac",
                             collectionKey: "col-hypnotic", songId: "s1",
                             acquiredAt: "2026-01-01T00:00:00Z"),
-                attribution(key: "a2", localPath: "/Volumes/External/MusicLibrary/Electronic/Hypnotic/two.flac",
+                attribution(key: "a2", localPath: "/music/Electronic/Hypnotic/two.flac",
                             collectionKey: "col-hypnotic", songId: "s2",
                             acquiredAt: "2026-01-02T00:00:00Z"),
-                attribution(key: "a3", localPath: "/Volumes/External/MusicLibrary/Jazz/other.flac",
+                attribution(key: "a3", localPath: "/music/Jazz/other.flac",
                             collectionKey: "col-jazz", songId: "s3",
                             acquiredAt: "2026-01-03T00:00:00Z")
             ])

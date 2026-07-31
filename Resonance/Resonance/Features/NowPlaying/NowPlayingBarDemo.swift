@@ -1,6 +1,6 @@
 import SwiftUI
 
-// DEMO 1: Apple Music exact clone attempt
+// DEMO 1: Compact centered transport
 // Progress bar integrated under controls, everything centered
 struct NowPlayingBarDemo1: View {
     @State private var progress: Double = 0.35
@@ -214,7 +214,7 @@ struct NowPlayingBarDemo3: View {
 struct NowPlayingBarDemos: View {
     var body: some View {
         VStack(spacing: 20) {
-            Text("DEMO 1: Apple Music clone").font(.caption).foregroundStyle(.secondary)
+            Text("DEMO 1: Compact centered").font(.caption).foregroundStyle(.secondary)
             NowPlayingBarDemo1()
 
             Text("DEMO 2: Progress on top").font(.caption).foregroundStyle(.secondary)

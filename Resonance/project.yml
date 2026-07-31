@@ -60,7 +60,7 @@ targets:
       properties:
         LSApplicationCategoryType: public.app-category.music
         CFBundleDisplayName: Resonance
-        NSHumanReadableCopyright: "Copyright © 2025. All rights reserved."
+        NSHumanReadableCopyright: "Copyright © 2026 mduncs. MIT licensed."
   ResonanceTests:
     type: bundle.unit-test
     platform: macOS
