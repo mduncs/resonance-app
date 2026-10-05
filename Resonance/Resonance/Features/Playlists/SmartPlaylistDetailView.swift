@@ -7,6 +7,8 @@ struct SmartPlaylistDetailView: View {
     @State private var songs: [Song] = []
     @State private var isLoading = true
     @State private var selection = Set<String>()
+    @State private var loadErrorMessage: String?
+    @State private var showingDeleteConfirm = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -23,7 +25,7 @@ struct SmartPlaylistDetailView: View {
                             .fontWeight(.bold)
                     }
 
-                    Text("\(songs.count) songs \(playlist.ruleGroup.conjunction == .and ? "(match all)" : "(match any)")")
+                    Text("\(songs.count) songs • \(totalDuration) \(playlist.ruleGroup.conjunction == .and ? "(match all)" : "(match any)")")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
@@ -63,7 +65,7 @@ struct SmartPlaylistDetailView: View {
                     Divider()
 
                     Button(role: .destructive) {
-                        deletePlaylist()
+                        showingDeleteConfirm = true
                     } label: {
                         Label("Delete", systemImage: "trash")
                     }
@@ -84,6 +86,20 @@ struct SmartPlaylistDetailView: View {
                 InlineLoadingStatusView(title: "Loading smart playlist...")
                     .padding(.horizontal, 24)
                     .padding(.top, 18)
+            } else if let loadErrorMessage {
+                CompactStatusView(
+                    title: "Couldn't Evaluate",
+                    systemImage: "exclamationmark.triangle",
+                    message: loadErrorMessage,
+                    actionTitle: "Retry",
+                    actionSystemImage: "arrow.clockwise",
+                    action: {
+                        refreshPlaylist()
+                    }
+                )
+                .padding(.horizontal, 24)
+                .padding(.top, 18)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
             } else if songs.isEmpty {
                 CompactStatusView(
                     title: "No Matching Songs",
@@ -149,23 +165,59 @@ struct SmartPlaylistDetailView: View {
                 .frame(minHeight: 300)
             }
         }
-        .task {
+        // Re-evaluate whenever the playlist value changes (e.g. rule edits).
+        .task(id: playlist) {
             await loadSongs()
         }
+        .confirmationDialog(
+            "Delete Smart Playlist?",
+            isPresented: $showingDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete", role: .destructive) {
+                deletePlaylist()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Are you sure you want to delete \"\(playlist.name)\"? Its rules are removed; your songs are not affected.")
+        }
+    }
+
+    private var totalDuration: String {
+        let total = songs.reduce(0) { $0 + $1.duration }
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        return hours > 0 ? "\(hours) hr \(minutes) min" : "\(minutes) min"
     }
 
     private func loadSongs() async {
         isLoading = true
+        loadErrorMessage = nil
         guard let serverId = appState.activeServerId else {
             isLoading = false
+            loadErrorMessage = "Select a server to evaluate this smart playlist."
             return
         }
 
-        // Re-evaluate to get fresh results
-        _ = try? appState.databaseManager.evaluateSmartPlaylist(playlist)
-        songs = (try? appState.databaseManager.loadSmartPlaylistSongs(
-            playlistId: playlist.id, serverId: serverId
-        )) ?? []
+        // Re-evaluate to get fresh results, distinguishing evaluation failure
+        // from a genuine zero-match result.
+        do {
+            _ = try appState.databaseManager.evaluateSmartPlaylist(playlist)
+        } catch {
+            isLoading = false
+            loadErrorMessage = "The playlist rules could not be evaluated. \(error.localizedDescription)"
+            return
+        }
+
+        do {
+            songs = try appState.databaseManager.loadSmartPlaylistSongs(
+                playlistId: playlist.id, serverId: serverId
+            )
+        } catch {
+            isLoading = false
+            loadErrorMessage = "Matched songs could not be loaded. \(error.localizedDescription)"
+            return
+        }
         isLoading = false
     }
 
@@ -185,7 +237,16 @@ struct SmartPlaylistDetailView: View {
 
     private func deletePlaylist() {
         guard let serverId = appState.activeServerId else { return }
-        try? appState.databaseManager.deleteSmartPlaylist(id: playlist.id)
-        appState.smartPlaylists = (try? appState.databaseManager.loadSmartPlaylists(serverId: serverId)) ?? []
+        do {
+            try appState.databaseManager.deleteSmartPlaylist(id: playlist.id)
+            appState.smartPlaylists = (try? appState.databaseManager.loadSmartPlaylists(serverId: serverId)) ?? []
+        } catch {
+            appState.showFeedback(
+                message: "Couldn't delete \"\(playlist.name)\"",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "exclamationmark.triangle"
+            )
+        }
     }
 }

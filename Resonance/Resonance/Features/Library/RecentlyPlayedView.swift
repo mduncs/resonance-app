@@ -9,7 +9,9 @@ struct RecentlyPlayedView: View {
 
     enum ViewState {
         case loading
+        case noServer
         case empty
+        case error(String)
         case populated
     }
 
@@ -110,6 +112,30 @@ struct RecentlyPlayedView: View {
                     .padding(.top, 18)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
+                case .noServer:
+                    CompactStatusView(
+                        title: "No Server Connected",
+                        systemImage: "externaldrive.connected.to.line.below",
+                        message: "Connect to a music server to keep a play history."
+                    )
+                    .padding(.horizontal, 24)
+                    .padding(.top, 18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                case .error(let message):
+                    CompactStatusView(
+                        title: "Failed to Load",
+                        systemImage: "exclamationmark.triangle",
+                        message: message,
+                        actionTitle: "Retry",
+                        actionSystemImage: "arrow.clockwise"
+                    ) {
+                        Task { await loadRecentlyPlayed() }
+                    }
+                    .padding(.horizontal, 24)
+                    .padding(.top, 18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
                 case .populated:
                     List(selection: $selection) {
                         ForEach(groupedItems, id: \.0) { section, items in
@@ -152,11 +178,19 @@ struct RecentlyPlayedView: View {
     private func loadRecentlyPlayed() async {
         guard let serverId = appState.activeServerId else {
             recentItems = []
-            viewState = .empty
+            viewState = .noServer
             return
         }
 
-        let history = (try? appState.databaseManager.loadPlayHistory(serverId: serverId, limit: 100)) ?? []
+        let history: [PlayHistoryEntry]
+        do {
+            history = try appState.databaseManager.loadPlayHistory(serverId: serverId, limit: 100)
+        } catch {
+            recentItems = []
+            viewState = .error(error.localizedDescription)
+            return
+        }
+
         let hiddenSongIds = (try? appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId)) ?? appState.hiddenSongIds
         let hiddenAlbumIds = (try? appState.databaseManager.loadHiddenIds(type: "album", serverId: serverId)) ?? appState.hiddenAlbumIds
         let visibleHistory = history.filter {
@@ -182,7 +216,7 @@ struct RecentlyPlayedView: View {
                 discNumber: nil,
                 year: nil,
                 genre: nil,
-                duration: entry.durationPlayed ?? 0,
+                duration: 0,  // History stores listened seconds, not track length; hide rather than lie.
                 bitRate: nil,
                 contentType: "audio/mpeg",
                 suffix: "mp3",
@@ -199,11 +233,22 @@ struct RecentlyPlayedView: View {
     }
 
     private func clearHistory() async {
-        try? appState.databaseManager.write { db in
-            try db.execute(sql: "DELETE FROM play_history")
+        // Scope the delete to the active server; play_history rows are per-server.
+        guard let serverId = appState.activeServerId else { return }
+        do {
+            try appState.databaseManager.write { db in
+                try db.execute(
+                    sql: "DELETE FROM play_history WHERE server_id = ?",
+                    arguments: [serverId]
+                )
+            }
+            recentItems = []
+            selection = []
+            viewState = .empty
+        } catch {
+            // A failed delete must not claim the persisted history is empty.
+            viewState = .error("Couldn't clear history: \(error.localizedDescription)")
         }
-        recentItems = []
-        viewState = .empty
     }
 
     private func playItem(_ item: RecentlyPlayedItem) async {
@@ -296,13 +341,19 @@ struct RecentlyPlayedRow: View {
                 }
             }
 
-            Text(item.song.formattedDuration)
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .monospacedDigit()
+            if item.song.duration > 0 {
+                Text(item.song.formattedDuration)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
         }
         .padding(.vertical, 4)
         .contentShape(Rectangle())
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(
+            "\(item.song.title) by \(item.song.artist), from \(item.song.album), played \(item.formattedTime)"
+        )
     }
 }
 

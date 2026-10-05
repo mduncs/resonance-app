@@ -45,7 +45,7 @@ struct GenreDetailView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .padding(.horizontal)
+            .padding(.horizontal, 24)
             .padding(.vertical, 8)
 
             // Content
@@ -152,60 +152,64 @@ struct GenreDetailView: View {
         ScrollView {
             LazyVGrid(columns: albumColumns, spacing: 20) {
                 ForEach(albums) { album in
-                    AlbumCard(album: album)
+                    AlbumCardActionSurface(
+                        album: album,
+                        onPlay: { Task { await playAlbum(album) } }
+                    ) { artworkHoverChanged in
+                        Button {
+                            selectedAlbum = album
+                        } label: {
+                            AlbumCard(
+                                album: album,
+                                showsHoverPlayButton: false,
+                                onArtworkHoverChange: artworkHoverChanged
+                            )
+                        }
+                        .buttonStyle(.plain)
                         .simultaneousGesture(
                             TapGesture(count: 2)
-                                .onEnded {
-                                    Task {
-                                        await playAlbum(album)
-                                    }
-                                }
+                                .onEnded { Task { await playAlbum(album) } }
                         )
-                        .simultaneousGesture(
-                            TapGesture(count: 1)
-                                .onEnded {
-                                    selectedAlbum = album
-                                }
-                        )
-                        .contextMenu {
-                            Button {
-                                Task {
-                                    await playAlbum(album)
-                                }
-                            } label: {
-                                Label("Play", systemImage: "play")
+                    }
+                    .contextMenu {
+                        Button {
+                            Task {
+                                await playAlbum(album)
                             }
-
-                            Button {
-                                Task {
-                                    await playAlbum(album, shuffled: true)
-                                }
-                            } label: {
-                                Label("Shuffle", systemImage: "shuffle")
-                            }
-
-                            Button {
-                                Task {
-                                    await addAlbumToQueue(album)
-                                }
-                            } label: {
-                                Label("Add to Queue", systemImage: "text.badge.plus")
-                            }
-
-                            Divider()
-
-                            Button {
-                                selectedAlbum = album
-                            } label: {
-                                Label("View Album", systemImage: "square.stack")
-                            }
-
-                            Button {
-                                appState.getInfoContent = .album(album)
-                            } label: {
-                                Label("Get Info", systemImage: "info.circle")
-                            }
+                        } label: {
+                            Label("Play", systemImage: "play")
                         }
+
+                        Button {
+                            Task {
+                                await playAlbum(album, shuffled: true)
+                            }
+                        } label: {
+                            Label("Shuffle", systemImage: "shuffle")
+                        }
+
+                        Button {
+                            Task {
+                                await addAlbumToQueue(album)
+                            }
+                        } label: {
+                            Label("Add to Queue", systemImage: "text.badge.plus")
+                        }
+
+                        Divider()
+
+                        Button {
+                            selectedAlbum = album
+                        } label: {
+                            Label("View Album", systemImage: "square.stack")
+                        }
+
+                        Button {
+                            appState.getInfoContent = .album(album)
+                        } label: {
+                            Label("Get Info", systemImage: "info.circle")
+                        }
+                    }
                 }
             }
             .padding()
@@ -247,8 +251,10 @@ struct GenreDetailView: View {
         }
         .tableStyle(.inset)
         .contextMenu(forSelectionType: String.self) { selectedIds in
-            if let songId = selectedIds.first,
-               let song = songs.first(where: { $0.id == songId }) {
+            let selectedSongs = songs.filter { selectedIds.contains($0.id) }
+            if selectedSongs.count > 1 {
+                BulkSongContextMenu(songs: selectedSongs)
+            } else if let song = selectedSongs.first {
                 SongContextMenu(song: song)
             }
         } primaryAction: { selectedIds in
@@ -260,26 +266,30 @@ struct GenreDetailView: View {
                 }
             }
         }
+        .onKeyPress(.return) {
+            if !songSelection.isEmpty,
+               let songId = songSelection.first,
+               let song = songs.first(where: { $0.id == songId }),
+               let index = songs.firstIndex(of: song) {
+                Task {
+                    await appState.playbackManager.play(songs: songs, startingAt: index)
+                }
+                return .handled
+            }
+            return .ignored
+        }
     }
 
     private func loadGenreContent() async {
         viewState = .loading
 
         do {
-            let admittedSongIds = loadLibraryMemberIds(type: .song, fallback: appState.admittedSongIds)
             let admittedAlbumIds = loadLibraryMemberIds(type: .album, fallback: appState.admittedAlbumIds)
-            let hiddenSongIds = loadHiddenIds(type: "song", fallback: appState.hiddenSongIds)
             let hiddenAlbumIds = loadHiddenIds(type: "album", fallback: appState.hiddenAlbumIds)
 
-            // Fetch songs by genre from the API
-            let fetchedSongs = try await appState.networkActor.fetchSongsByGenre(
-                genre: genre.name,
-                count: 500,
-                offset: 0
-            )
-            songs = fetchedSongs.filter {
-                admittedSongIds.contains($0.id) && !hiddenSongIds.contains($0.id)
-            }
+            // Page through every genre song; a single request would silently
+            // truncate large genres behind Subsonic's per-response cap.
+            songs = try await GenreSongsFetcher.fetchAllAdmitted(appState: appState, genre: genre.name)
 
             // Derive unique albums from the songs
             var uniqueAlbums: [String: Album] = [:]
@@ -441,11 +451,11 @@ private struct GenreHeaderView: View {
                 return [.red, .orange]
             case let name where name.contains("jazz"):
                 return [.blue, .purple]
-            case let name where name.contains("electronic"), let name where name.contains("edm"):
+            case let name where name.contains("electronic") || name.contains("edm"):
                 return [.cyan, .blue]
             case let name where name.contains("classical"):
                 return [.brown, .orange]
-            case let name where name.contains("hip"), let name where name.contains("rap"):
+            case let name where name.contains("hip") || name.contains("rap"):
                 return [.yellow, .orange]
             case let name where name.contains("pop"):
                 return [.pink, .purple]
@@ -453,7 +463,7 @@ private struct GenreHeaderView: View {
                 return [.orange, .brown]
             case let name where name.contains("metal"):
                 return [.gray, .black]
-            case let name where name.contains("r&b"), let name where name.contains("soul"):
+            case let name where name.contains("r&b") || name.contains("soul"):
                 return [.purple, .pink]
             default:
                 return [.accentColor, .accentColor.opacity(0.7)]
@@ -468,11 +478,11 @@ private struct GenreHeaderView: View {
             return "guitars"
         case let name where name.contains("jazz"):
             return "music.quarternote.3"
-        case let name where name.contains("electronic"), let name where name.contains("edm"):
+        case let name where name.contains("electronic") || name.contains("edm"):
             return "waveform"
         case let name where name.contains("classical"):
             return "music.note.list"
-        case let name where name.contains("hip"), let name where name.contains("rap"):
+        case let name where name.contains("hip") || name.contains("rap"):
             return "music.mic"
         case let name where name.contains("pop"):
             return "sparkles"

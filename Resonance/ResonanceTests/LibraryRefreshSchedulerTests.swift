@@ -15,12 +15,15 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
         }
     }
 
+    @MainActor
     private final class Recorder {
         var savedArtistIds: [String] = []
         var savedAlbumIds: [String] = []
         var savedSongIds: [String] = []
         var metadata: [String: String] = [:]
         var refreshCount = 0
+        var appliedArtistIds: [String] = []
+        var appliedAlbumIds: [String] = []
         /// Every sweep the executor actually attempted, in order.
         var pruneCalls: [DatabaseManager.PrunableLibraryItem] = []
         /// Sync start time handed to each sweep.
@@ -96,10 +99,10 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
             replayGain: nil
         )
 
-        let summary = await runRefresh(recorder: recorder) { onPage in
+        let summary = await runRefresh(recorder: recorder, fetchSongs: { onPage in
             try await onPage([song])
             throw TestError.songs
-        }
+        })
 
         XCTAssertEqual(recorder.savedSongIds, [song.id])
         XCTAssertTrue(summary.persistedLegs.contains("songs"))
@@ -110,7 +113,7 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
     /// A songs leg that succeeds with a fully-walked library.
     private static func completeSongsLeg(
         _ song: Song? = nil
-    ) -> (@escaping @MainActor @Sendable ([Song]) async throws -> Void) async throws -> SongLibraryFetchResult {
+    ) -> @MainActor @Sendable (@escaping @MainActor @Sendable ([Song]) async throws -> Void) async throws -> SongLibraryFetchResult {
         { onPage in
             if let song { try await onPage([song]) }
             return SongLibraryFetchResult(
@@ -177,10 +180,10 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
         // but the enumeration is partial — sweeping would delete the remainder
         // of the library.
         let recorder = Recorder()
-        let summary = await runRefresh(recorder: recorder) { onPage in
+        let summary = await runRefresh(recorder: recorder, fetchSongs: { onPage in
             try await onPage([Self.makeSong()])
             throw TestError.songs
-        }
+        })
 
         XCTAssertTrue(summary.persistedLegs.contains("songs"), "precondition: the leg did persist rows")
         XCTAssertFalse(recorder.pruneCalls.contains(.song), "persisted-but-incomplete must not sweep")
@@ -235,10 +238,153 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
         XCTAssertTrue(recorder.metadata["lastPrune.server-1"]?.contains("songs=skipped") == true)
     }
 
+    func testObsoleteOriginAfterIncrementalPageDoesNotPublishOrSweep() async {
+        let recorder = Recorder()
+        var originIsCurrent = true
+        let summary = await runRefresh(
+            recorder: recorder,
+            validateOrigin: {
+                try Task.checkCancellation()
+                guard originIsCurrent else { throw CancellationError() }
+            },
+            fetchSongs: { onPage in
+                try await onPage([Self.makeSong()])
+                originIsCurrent = false
+                return SongLibraryFetchResult(
+                    songCount: 1,
+                    path: .emptyQuerySearch,
+                    fallbackReason: nil,
+                    walk: .complete
+                )
+            }
+        )
+
+        XCTAssertEqual(recorder.savedSongIds, ["song-1"], "a page saved under the captured origin remains safe")
+        XCTAssertTrue(recorder.savedArtistIds.isEmpty)
+        XCTAssertTrue(recorder.savedAlbumIds.isEmpty)
+        XCTAssertTrue(recorder.appliedArtistIds.isEmpty)
+        XCTAssertTrue(recorder.appliedAlbumIds.isEmpty)
+        XCTAssertTrue(recorder.pruneCalls.isEmpty)
+        XCTAssertNil(recorder.metadata["lastSync.server-1"])
+        XCTAssertTrue(summary.failures.isEmpty, "origin invalidation is cancellation, not a sync error")
+    }
+
+    func testCancelingExecutorCancelsStructuredChildrenAndPreventsPublication() async {
+        let recorder = Recorder()
+        let task = Task { @MainActor in
+            await runRefresh(recorder: recorder, fetchSongs: { _ in
+                while !Task.isCancelled { await Task.yield() }
+                throw CancellationError()
+            })
+        }
+
+        for _ in 0..<10 { await Task.yield() }
+        task.cancel()
+        let summary = await task.value
+
+        XCTAssertTrue(summary.persistedLegs.isEmpty)
+        XCTAssertTrue(summary.failures.isEmpty)
+        XCTAssertTrue(recorder.savedArtistIds.isEmpty)
+        XCTAssertTrue(recorder.savedAlbumIds.isEmpty)
+        XCTAssertTrue(recorder.savedSongIds.isEmpty)
+        XCTAssertTrue(recorder.pruneCalls.isEmpty)
+        XCTAssertNil(recorder.metadata["lastSync.server-1"])
+    }
+
+    func testConnectedServerTransitionReplacesCanceledRefreshWithoutOldCleanupClearingNewTask() async {
+        let recorder = Recorder()
+        var serverID = "server-A"
+        var starts: [String] = []
+        var allowAFinish = false
+        var allowBFinish = false
+        let scheduler = LibraryRefreshScheduler(
+            connectionSnapshot: { (.connected, serverID) },
+            successfulSyncExists: { _ in false },
+            refresh: {
+                let startedServer = serverID
+                starts.append(startedServer)
+                if startedServer == "server-A" {
+                    while !Task.isCancelled { await Task.yield() }
+                    while !allowAFinish { await Task.yield() }
+                } else {
+                    while !allowBFinish { await Task.yield() }
+                }
+                recorder.refreshCount += 1
+            }
+        )
+
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts != ["server-A"] { await Task.yield() }
+        serverID = "server-B"
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where !starts.contains("server-B") { await Task.yield() }
+
+        allowAFinish = true
+        for _ in 0..<20 { await Task.yield() }
+        let waiter = Task { @MainActor in await scheduler.refreshNow() }
+        for _ in 0..<20 { await Task.yield() }
+        XCTAssertEqual(starts, ["server-A", "server-B"], "old completion must not clear and duplicate B")
+
+        allowBFinish = true
+        await waiter.value
+        XCTAssertEqual(recorder.refreshCount, 2)
+        scheduler.cleanup()
+    }
+
+    func testFolderOriginChangeReplacesInFlightRefresh() async {
+        var origin = "server-1|folder-A"
+        var starts: [String] = []
+        let scheduler = LibraryRefreshScheduler(
+            connectionSnapshot: { (.connected, "server-1") },
+            successfulSyncExists: { _ in false },
+            connectionOrigin: { origin },
+            refresh: {
+                starts.append(origin)
+                while !Task.isCancelled { await Task.yield() }
+            }
+        )
+
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts.count < 1 { await Task.yield() }
+        origin = "server-1|folder-B"
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts.count < 2 { await Task.yield() }
+
+        XCTAssertEqual(starts, ["server-1|folder-A", "server-1|folder-B"])
+        scheduler.cleanup()
+    }
+
+    func testCanceledConnectionAttemptDoesNotSuppressABAReconnect() async {
+        var serverID = "server-A"
+        var starts: [String] = []
+        let scheduler = LibraryRefreshScheduler(
+            connectionSnapshot: { (.connected, serverID) },
+            successfulSyncExists: { _ in false },
+            now: { Date(timeIntervalSince1970: 2_000) },
+            refresh: {
+                starts.append(serverID)
+                while !Task.isCancelled { await Task.yield() }
+            }
+        )
+
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts.count < 1 { await Task.yield() }
+        serverID = "server-B"
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts.count < 2 { await Task.yield() }
+        serverID = "server-A"
+        scheduler.connectionStateDidChange()
+        for _ in 0..<40 where starts.count < 3 { await Task.yield() }
+
+        XCTAssertEqual(starts, ["server-A", "server-B", "server-A"])
+        scheduler.cleanup()
+    }
+
     private func runRefresh(
         recorder: Recorder,
         albumWalk: LibraryWalkOutcome = .complete,
-        fetchSongs: @escaping (
+        validateOrigin: @escaping @MainActor @Sendable () throws -> Void = { try Task.checkCancellation() },
+        fetchSongs: @escaping @MainActor @Sendable (
             _ onPage: @escaping @MainActor @Sendable ([Song]) async throws -> Void
         ) async throws -> SongLibraryFetchResult = { _ in throw TestError.songs }
     ) async -> LibraryRefreshExecutor.Summary {
@@ -271,6 +417,7 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
                 fetchAlbums: { AlbumLibraryFetchResult(albums: [album], walk: albumWalk) },
                 fetchSongs: fetchSongs,
                 fetchStarred: { throw TestError.starred },
+                validateOrigin: validateOrigin,
                 knownAlbumIds: { [] },
                 saveArtists: { recorder.savedArtistIds += $0.map(\.id) },
                 saveAlbums: { recorder.savedAlbumIds += $0.map(\.id) },
@@ -283,8 +430,8 @@ final class LibraryRefreshSchedulerTests: XCTestCase {
                 admittedAlbums: { [album] },
                 refreshMembership: {},
                 refreshLikedIds: {},
-                applyArtists: { _ in },
-                applyAlbums: { _ in },
+                applyArtists: { recorder.appliedArtistIds += $0.map(\.id) },
+                applyAlbums: { recorder.appliedAlbumIds += $0.map(\.id) },
                 pruneStale: { item, cutoff in
                     recorder.pruneCalls.append(item)
                     recorder.pruneCutoffs.append(cutoff)

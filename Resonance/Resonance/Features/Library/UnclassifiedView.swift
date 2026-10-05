@@ -440,7 +440,7 @@ struct UnclassifiedView: View {
                 .filter { !waitingRoomSongIds.contains($0.id) }
             songs = loadedSongs
             sourceAttributions = try appState.databaseManager
-                .sourceAttributionsBySongId(songs: loadedSongs)
+                .sourceAttributionsBySongId(songs: loadedSongs, serverId: serverId)
             clearedTodayCount = try appState.databaseManager
                 .unclassifiedClearedTodayCount(serverId: serverId)
             pruneInteractionState()

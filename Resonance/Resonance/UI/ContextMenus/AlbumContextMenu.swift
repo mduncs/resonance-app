@@ -37,30 +37,15 @@ struct AlbumContextMenu: View {
         Divider()
 
         // Playlists
-        Menu {
-            ForEach(appState.playlists) { playlist in
-                Button {
-                    Task {
-                        await addAlbumToPlaylist(playlist)
-                    }
-                } label: {
-                    Label(playlist.name, systemImage: "music.note.list")
-                }
+        PlaylistDestinationMenu(onSelect: { playlist in
+            Task { await addAlbumToPlaylist(playlist) }
+        }, onBrowse: {
+            appState.choosePlaylist {
+                try await appState.playableAlbumSongs(for: album).map(\.id)
             }
-
-            Divider()
-
-            Button {
-                Task {
-                    await createPlaylistWithAlbumSongs()
-                }
-            } label: {
-                Label("New Playlist...", systemImage: "plus")
-            }
-        } label: {
-            Label("Add to Playlist", systemImage: "text.badge.plus")
-        }
-
+        }, onCreate: {
+            Task { await createPlaylistWithAlbumSongs() }
+        })
         Divider()
 
         // Navigation
@@ -280,17 +265,11 @@ struct AlbumContextMenu: View {
             if albumIsHidden {
                 try appState.databaseManager.unhideItem(id: album.id, type: "album", serverId: serverId)
                 albumIsHidden = false
-                // Re-add to runtime array if not already present
-                if !appState.albums.contains(where: { $0.id == album.id }) {
-                    appState.albums.append(album)
-                    appState.albums.sort { $0.name < $1.name }
-                }
             } else {
                 try appState.databaseManager.hideItem(id: album.id, type: "album", serverId: serverId)
                 albumIsHidden = true
-                // Remove from runtime array immediately
-                appState.albums.removeAll { $0.id == album.id }
             }
+            appState.invalidateFullAlbumCatalog()
             appState.refreshHiddenIds()
         } catch {
             print("Failed to toggle hide: \(error)")
@@ -306,18 +285,17 @@ struct AlbumContextMenu: View {
     }
 
     private func setRating(_ rating: Int) {
-        let previousRating = album.rating
         let newRating = rating == 0 ? nil : rating
 
         // Optimistic update
-        appState.updateAlbumRating(id: album.id, rating: newRating)
+        let actionRevision = appState.updateAlbumRating(id: album.id, rating: newRating)
 
         Task {
             do {
                 try await appState.networkActor.setRating(id: album.id, rating: rating)
+                appState.confirmAlbumRating(id: album.id, actionRevision: actionRevision)
             } catch {
-                // Revert on failure
-                appState.updateAlbumRating(id: album.id, rating: previousRating)
+                appState.rejectAlbumRating(id: album.id, actionRevision: actionRevision)
             }
         }
     }

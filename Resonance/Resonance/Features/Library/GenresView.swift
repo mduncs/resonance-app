@@ -14,6 +14,39 @@ enum GenreLayoutStyle: String, CaseIterable {
     }
 }
 
+// MARK: - Complete Genre Enumeration
+
+/// Fetches every admitted song of a genre by paging through getSongsByGenre.
+/// Subsonic caps each response, so a single fixed-size request silently
+/// truncates large genres; enumerate until a short page returns.
+/// Main-actor isolated: reads cached admission state off `AppState`, and every
+/// caller is a view. Matches `CurationVerbRegistry`.
+@MainActor
+enum GenreSongsFetcher {
+    static func fetchAllAdmitted(appState: AppState, genre: String) async throws -> [Song] {
+        guard let serverId = appState.activeServerId else { return [] }
+        let admitted = (try? appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: serverId))
+            ?? appState.admittedSongIds
+        let hidden = (try? appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId))
+            ?? appState.hiddenSongIds
+
+        let pageSize = 500
+        var collected: [Song] = []
+        var seenIds = Set<String>()
+        var offset = 0
+
+        while true {
+            let page = try await appState.networkActor.fetchSongsByGenre(genre: genre, count: pageSize, offset: offset)
+            for song in page
+            where admitted.contains(song.id) && !hidden.contains(song.id) && seenIds.insert(song.id).inserted {
+                collected.append(song)
+            }
+            if page.count < pageSize || page.isEmpty { break }
+            offset += pageSize
+        }
+        return collected
+    }
+}
 struct GenresView: View {
     @Environment(AppState.self) private var appState
     @State private var genres: [Genre] = []
@@ -123,12 +156,14 @@ struct GenresView: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .navigationTitle("")
         .searchable(text: $searchText, prompt: "Search genres")
-        .task {
+        .task(id: appState.activeServerId) {
             await loadGenres()
         }
     }
 
     private func loadGenres() async {
+        // Do not leave the previous server's count visible if the new load fails.
+        genres = []
         viewState = .loading
         guard let serverId = appState.activeServerId else {
             genres = []
@@ -150,19 +185,22 @@ struct GenresView: View {
 
 struct GenreGridView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let genres: [Genre]
 
     @State private var selectedGenreId: String?
+    @State private var viewportWidth: CGFloat = 0
     @FocusState private var isGridFocused: Bool
 
     private let columns = [
         GridItem(.adaptive(minimum: 160, maximum: 200), spacing: 20)
     ]
 
-    // Estimate columns based on typical content area width
+    // Match vertical keyboard movement to the current viewport, including a
+    // resized window or an open inspector.
     private var estimatedColumnsPerRow: Int {
-        let estimatedContentWidth = (NSScreen.main?.frame.width ?? 1200) * 0.7
-        return max(1, Int(estimatedContentWidth / 200))
+        let availableWidth = max(0, viewportWidth - 48)
+        return max(1, Int((availableWidth + 20) / 180))
     }
 
     var body: some View {
@@ -173,6 +211,7 @@ struct GenreGridView: View {
                         GenreCard(
                             genre: genre,
                             isSelected: selectedGenreId == genre.id,
+                            onSelect: { selectedGenreId = genre.id },
                             onPlay: {
                                 Task { await playGenre(genre) }
                             },
@@ -186,11 +225,23 @@ struct GenreGridView: View {
                 .padding(.horizontal, 24)
                 .padding(.bottom, 24)
             }
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { viewportWidth = geometry.size.width }
+                        .onChange(of: geometry.size.width) { _, width in
+                            viewportWidth = width
+                        }
+                }
+            }
             .focusable()
             .focused($isGridFocused)
             .focusEffectDisabled()
             .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) { press in
                 handleArrowKey(press.key, proxy: proxy)
+            }
+            .onKeyPress(keys: [.return, .space]) { _ in
+                openSelectedGenre()
             }
             .onKeyPress(keys: [KeyEquivalent("p")]) { _ in
                 if let genreId = selectedGenreId,
@@ -203,6 +254,11 @@ struct GenreGridView: View {
         }
         .onAppear {
             isGridFocused = true
+        }
+        .onChange(of: genres.map(\.id), initial: true) { _, visibleIDs in
+            if let selectedGenreId, !visibleIDs.contains(selectedGenreId) {
+                self.selectedGenreId = nil
+            }
         }
     }
 
@@ -220,7 +276,7 @@ struct GenreGridView: View {
            newIndex >= 0, newIndex < genres.count {
             let newId = genres[newIndex].id
             selectedGenreId = newId
-            withAnimation {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                 proxy.scrollTo(newId, anchor: .center)
             }
             return .handled
@@ -228,12 +284,18 @@ struct GenreGridView: View {
         return .ignored
     }
 
+    /// Opens the selected genre just as Return/Space does for the other grids.
+    private func openSelectedGenre() -> KeyPress.Result {
+        guard let genre = selectedGenreId.flatMap({ id in genres.first(where: { $0.id == id }) })
+                ?? genres.first else { return .ignored }
+        selectedGenreId = genre.id
+        appState.detailNavigationPath.append(genre)
+        return .handled
+    }
+
     private func playGenre(_ genre: Genre) async {
         do {
-            let admittedSongIds = loadAdmittedSongIds()
-            let hiddenSongIds = loadHiddenSongIds()
-            let songs = try await appState.networkActor.fetchSongsByGenre(genre: genre.name, count: 100, offset: 0)
-                .filter { admittedSongIds.contains($0.id) && !hiddenSongIds.contains($0.id) }
+            let songs = try await GenreSongsFetcher.fetchAllAdmitted(appState: appState, genre: genre.name)
             if !songs.isEmpty {
                 await appState.playbackManager.play(songs: songs.shuffled())
             }
@@ -242,26 +304,15 @@ struct GenreGridView: View {
         }
     }
 
-    private func loadAdmittedSongIds() -> Set<String> {
-        guard let serverId = appState.activeServerId else {
-            return appState.admittedSongIds
-        }
-        return (try? appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: serverId)) ?? appState.admittedSongIds
-    }
-
-    private func loadHiddenSongIds() -> Set<String> {
-        guard let serverId = appState.activeServerId else {
-            return appState.hiddenSongIds
-        }
-        return (try? appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId)) ?? appState.hiddenSongIds
-    }
 }
 
 // MARK: - Genre Card (Apple Music Style)
 
 struct GenreCard: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let genre: Genre
     let isSelected: Bool
+    let onSelect: () -> Void
     let onPlay: () -> Void
     let onNavigate: () -> Void
 
@@ -340,13 +391,13 @@ struct GenreCard: View {
                 if isHovered {
                     playButton
                         .padding(8)
-                        .transition(.scale.combined(with: .opacity))
+                        .transition(reduceMotion ? .identity : .scale.combined(with: .opacity))
                 }
             }
-            .scaleEffect(isHovered ? 1.02 : 1.0)
-            .animation(DesignTokens.Animation.quick, value: isHovered)
+            .scaleEffect(isHovered && !reduceMotion ? 1.02 : 1.0)
+            .animation(reduceMotion ? nil : DesignTokens.Animation.quick, value: isHovered)
             .onHover { hovering in
-                withAnimation(DesignTokens.Animation.quick) {
+                withAnimation(reduceMotion ? nil : DesignTokens.Animation.quick) {
                     isHovered = hovering
                 }
             }
@@ -370,9 +421,15 @@ struct GenreCard: View {
         .frame(width: size)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) {
+            guard !isPlayButtonHovered else { return }
+            onSelect()
             onPlay()
         }
         .onTapGesture {
+            // The play control is nested inside the card's hit region; don't
+            // let its click also push the genre detail route.
+            guard !isPlayButtonHovered else { return }
+            onSelect()
             onNavigate()
         }
         .contextMenu {
@@ -386,8 +443,10 @@ struct GenreCard: View {
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(genre.name), \(genre.albumCount) albums, \(genre.songCount) songs")
-        .accessibilityHint("Double tap to play, tap to view details")
+        .accessibilityHint("Opens genre details.")
         .accessibilityAddTraits(.isButton)
+        .accessibilityAction(named: "Play") { onPlay() }
+        .accessibilityAction(named: "Open") { onNavigate() }
     }
 
     @ViewBuilder
@@ -407,9 +466,10 @@ struct GenreCard: View {
             }
         }
         .buttonStyle(.plain)
+        .accessibilityLabel("Play \(genre.name)")
         .onHover { isPlayButtonHovered = $0 }
-        .scaleEffect(isPlayButtonHovered ? 1.1 : 1.0)
-        .animation(DesignTokens.Animation.quick, value: isPlayButtonHovered)
+        .scaleEffect(isPlayButtonHovered && !reduceMotion ? 1.1 : 1.0)
+        .animation(reduceMotion ? nil : DesignTokens.Animation.quick, value: isPlayButtonHovered)
     }
 
     /// Generate consistent colors based on genre name
@@ -558,10 +618,7 @@ struct GenreContextMenu: View {
 
     private func playGenre(shuffled: Bool) async {
         do {
-            let admittedSongIds = loadAdmittedSongIds()
-            let hiddenSongIds = loadHiddenSongIds()
-            var songs = try await appState.networkActor.fetchSongsByGenre(genre: genre.name, count: 100, offset: 0)
-                .filter { admittedSongIds.contains($0.id) && !hiddenSongIds.contains($0.id) }
+            var songs = try await GenreSongsFetcher.fetchAllAdmitted(appState: appState, genre: genre.name)
             if shuffled {
                 songs.shuffle()
             }
@@ -575,29 +632,13 @@ struct GenreContextMenu: View {
 
     private func addToQueue() async {
         do {
-            let admittedSongIds = loadAdmittedSongIds()
-            let hiddenSongIds = loadHiddenSongIds()
-            let songs = try await appState.networkActor.fetchSongsByGenre(genre: genre.name, count: 100, offset: 0)
-                .filter { admittedSongIds.contains($0.id) && !hiddenSongIds.contains($0.id) }
+            let songs = try await GenreSongsFetcher.fetchAllAdmitted(appState: appState, genre: genre.name)
             appState.playbackManager.addToQueue(songs)
         } catch {
             print("Failed to add genre to queue: \(error)")
         }
     }
 
-    private func loadAdmittedSongIds() -> Set<String> {
-        guard let serverId = appState.activeServerId else {
-            return appState.admittedSongIds
-        }
-        return (try? appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: serverId)) ?? appState.admittedSongIds
-    }
-
-    private func loadHiddenSongIds() -> Set<String> {
-        guard let serverId = appState.activeServerId else {
-            return appState.hiddenSongIds
-        }
-        return (try? appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId)) ?? appState.hiddenSongIds
-    }
 }
 
 // MARK: - Loading View
@@ -645,8 +686,9 @@ struct GenreLoadingView: View {
                             .frame(width: 40, height: 40)
                         VStack(alignment: .leading) {
                             Text("Genre Name")
-                            Text("12 albums")
-                                .font(.caption)
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(DesignTokens.Placeholder.adaptive)
+                                .frame(width: 60, height: 12)
                         }
                         Spacer()
                     }

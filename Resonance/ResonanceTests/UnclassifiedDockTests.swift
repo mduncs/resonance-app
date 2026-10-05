@@ -159,7 +159,7 @@ final class UnclassifiedDockTests: XCTestCase {
             sourceCollectionKey: "collection:\(key)",
             sourceKind: "apple_playlist",
             sourceDisplayName: "Display \(key)",
-            downloadSource: "gamdl",
+            downloadSource: "fetcher",
             queryContext: "ctx",
             acquiredAt: "2026-02-01T00:00:00.000Z",
             contractVersion: 2,

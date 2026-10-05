@@ -26,6 +26,7 @@ struct PlaneView: View {
     @State private var admitting = false
     @State private var lastMagnify: CGFloat = 1
     @State private var toastMessage: String?
+    @State private var albumCatalogError: String?
     /// Bumped on every toast so a stale dismissal can't clear a newer message.
     @State private var toastToken = 0
     @FocusState private var isFocused: Bool
@@ -50,6 +51,18 @@ struct PlaneView: View {
             chrome
             hints
             toast
+            if let albumCatalogError {
+                CompactStatusView(
+                    title: "Albums Unavailable",
+                    systemImage: "square.stack",
+                    message: albumCatalogError,
+                    actionTitle: "Retry",
+                    actionSystemImage: "arrow.clockwise"
+                ) {
+                    Task { await loadData() }
+                }
+                .frame(maxWidth: 420)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .focusable()
@@ -718,6 +731,8 @@ struct PlaneView: View {
     /// Changes when the album set changes, re-triggering the lane rebuild.
     private var albumsFingerprint: Int {
         var hasher = Hasher()
+        hasher.combine(appState.activeServer?.id)
+        hasher.combine(appState.fullAlbumCatalogServerID)
         hasher.combine(appState.albums.count)
         hasher.combine(appState.albums.first?.id)
         hasher.combine(appState.albums.last?.id)
@@ -728,6 +743,21 @@ struct PlaneView: View {
     /// then publish them together and build the lanes. The two reads share one
     /// detached hop so the plane never shows voices without their decorations.
     private func loadData() async {
+        guard let expectedServerID = appState.activeServer?.id else {
+            lanes = []
+            return
+        }
+        do {
+            try await appState.ensureFullAlbumCatalog(expectedServerID: expectedServerID)
+            albumCatalogError = nil
+        } catch is CancellationError {
+            return
+        } catch {
+            guard appState.activeServer?.id == expectedServerID else { return }
+            albumCatalogError = error.localizedDescription
+            return
+        }
+        guard !Task.isCancelled, appState.activeServer?.id == expectedServerID else { return }
         let albums = appState.albums
         let database = appState.databaseManager
         let ids = albums.map(\.id)
@@ -738,6 +768,8 @@ struct PlaneView: View {
             let decorations = (try? database.planeDecorations(forAlbumIds: ids)) ?? [:]
             return (voices, decorations)
         }.value
+
+        guard !Task.isCancelled, appState.activeServer?.id == expectedServerID else { return }
 
         voicesByAlbum = resolved.voices
         decorations = resolved.decorations

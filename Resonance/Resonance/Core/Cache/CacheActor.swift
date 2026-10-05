@@ -17,6 +17,13 @@ final class DownloadProgressState: @unchecked Sendable {
     /// Completed downloads for UI refresh (cleared periodically)
     var recentlyCompleted: Set<String> = []
 
+    /// Invalidates download-status readers after additions, removals, or repair.
+    var manifestRevisions: [UUID: UInt64] = [:]
+
+    func bumpManifestRevision(for serverId: UUID) {
+        manifestRevisions[serverId, default: 0] &+= 1
+    }
+
     /// Failed downloads with error message
     var failedDownloads: [String: String] = [:]
 
@@ -103,7 +110,7 @@ actor CacheActor {
 
     // Default limits
     private var maxArtworkCacheSize: Int64 = 500 * 1024 * 1024  // 500 MB
-    private var maxAudioCacheSize: Int64 = 10 * 1024 * 1024 * 1024  // 10 GB
+    private var maxAudioCacheSize: Int64 = 5 * 1024 * 1024 * 1024  // Settings default: 5 GB
     private var maxResponseCacheSize: Int64 = 50 * 1024 * 1024  // 50 MB
 
     // Download queue
@@ -124,17 +131,26 @@ actor CacheActor {
     ) {
         self.fileManager = fileManager
 
-        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
-        self.cacheDirectory = cacheDirectory ?? caches.appendingPathComponent(
-            PublicDemoConfiguration.appSupportDirectoryName,
-            isDirectory: true
-        )
+        // Explicit fixture/test roots must not resolve normal home directories.
+        // Keep each fallback lazy, including when only one root is injected.
+        if let cacheDirectory {
+            self.cacheDirectory = cacheDirectory
+        } else {
+            let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first!
+            self.cacheDirectory = caches.appendingPathComponent(
+                PublicDemoConfiguration.appSupportDirectoryName,
+                isDirectory: true
+            )
+        }
 
-        let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        self.downloadsDirectory = downloadsDirectory
-            ?? appSupport
-            .appendingPathComponent(PublicDemoConfiguration.appSupportDirectoryName, isDirectory: true)
-            .appendingPathComponent("Downloads", isDirectory: true)
+        if let downloadsDirectory {
+            self.downloadsDirectory = downloadsDirectory
+        } else {
+            let appSupport = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            self.downloadsDirectory = appSupport
+                .appendingPathComponent(PublicDemoConfiguration.appSupportDirectoryName, isDirectory: true)
+                .appendingPathComponent("Downloads", isDirectory: true)
+        }
 
         // Initialize progress state on main actor
         self.progressState = DownloadProgressState()
@@ -584,6 +600,9 @@ actor CacheActor {
             try? data.write(to: downloadManifestURL(for: serverId), options: .atomic)
         }
         downloadManifestCache[serverId] = manifest
+        Task { @MainActor [progressState] in
+            progressState.bumpManifestRevision(for: serverId)
+        }
     }
 
     private func sanitizedDownloadManifest(for serverId: UUID) -> [String: DownloadRecord] {
@@ -886,14 +905,22 @@ actor CacheActor {
         maxArtworkCacheSize = size
     }
 
+    nonisolated static func audioCacheLimitBytes(gigabytes: Double) -> Int64 {
+        guard gigabytes.isFinite, gigabytes > 0 else { return .max }
+        let bytes = gigabytes * 1024 * 1024 * 1024
+        return bytes >= Double(Int64.max) ? .max : Int64(bytes)
+    }
+
     func setMaxAudioCacheSize(_ size: Int64) {
         maxAudioCacheSize = size
     }
 
     // MARK: - Lyrics Cache
 
-    func cacheLyrics(_ lyrics: CachedLyrics, for songId: String) {
+    func cacheLyrics(_ lyrics: CachedLyrics, for songId: String, serverId: UUID?) {
+        guard let serverId else { return }
         let lyricsDir = cacheDirectory.appendingPathComponent("lyrics")
+            .appendingPathComponent(serverId.uuidString, isDirectory: true)
         try? fileManager.createDirectory(at: lyricsDir, withIntermediateDirectories: true)
 
         let path = lyricsDir.appendingPathComponent("\(songId).json")
@@ -905,8 +932,11 @@ actor CacheActor {
         }
     }
 
-    func getLyrics(for songId: String) -> CachedLyrics? {
+    func getLyrics(for songId: String, serverId: UUID?) -> CachedLyrics? {
+        guard let serverId else { return nil }
+        // Legacy unscoped entries cannot be attributed to a particular server.
         let path = cacheDirectory.appendingPathComponent("lyrics")
+            .appendingPathComponent(serverId.uuidString, isDirectory: true)
             .appendingPathComponent("\(songId).json")
 
         guard let data = try? Data(contentsOf: path) else { return nil }
@@ -937,7 +967,15 @@ actor CacheActor {
         accessTimes = [:]
         responseExpiry = [:]
         imageCache.removeAllObjects()
-        createDirectoryStructure()
+        // Cleanup must surface recreation failures, not report an unusable cache
+        // as successfully cleared. Offline downloads live outside this tree.
+        for subdirectory in ["", "artwork", "audio", "responses", "metadata"] {
+            try fileManager.createDirectory(
+                at: cacheDirectory.appendingPathComponent(subdirectory, isDirectory: true),
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
     }
 
     func clearArtworkCache() async throws {
@@ -967,13 +1005,9 @@ actor CacheActor {
         return artworkSize + audioSize + responseSize
     }
 
-    /// Removes all cached artwork and audio files, recreates directory structure
-    func clearAll() async {
-        try? fileManager.removeItem(at: cacheDirectory)
-        accessTimes = [:]
-        responseExpiry = [:]
-        imageCache.removeAllObjects()
-        createDirectoryStructure()
+    /// Removes temporary caches without removing intentional offline downloads.
+    func clearAll() async throws {
+        try await clearAllCaches()
     }
 
     func getCacheStats() async -> CacheStats {

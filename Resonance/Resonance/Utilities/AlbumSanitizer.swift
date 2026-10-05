@@ -1,58 +1,37 @@
 import Foundation
 
-/// Sanitizes album data by deduplicating and filtering invalid entries
+/// Removes repeated native identities without guessing release equivalence.
 struct AlbumSanitizer {
-    /// Deduplicates albums by name+artist and filters invalid entries
+    /// Names, artists and metadata completeness do not establish album identity.
+    /// Distinct server IDs may be editions or fragments containing unique tracks.
+    /// Keep their original order; only repeated IDs represent the same result.
     static func sanitize(_ albums: [Album]) -> [Album] {
-        var seen: [String: Album] = [:]
+        var positions: [String: Int] = [:]
+        var result: [Album] = []
+        result.reserveCapacity(albums.count)
 
         for album in albums {
             guard isValid(album) else { continue }
 
-            let key = normalizedKey(for: album)
-
-            if let existing = seen[key] {
-                // keep the higher quality version
-                if qualityScore(for: album) > qualityScore(for: existing) {
-                    seen[key] = album
+            if let position = positions[album.id] {
+                if qualityScore(for: album) > qualityScore(for: result[position]) {
+                    result[position] = album
                 }
             } else {
-                seen[key] = album
+                positions[album.id] = result.count
+                result.append(album)
             }
         }
 
-        return Array(seen.values)
+        return result
     }
 
     /// Checks if an album has valid, displayable data
     static func isValid(_ album: Album) -> Bool {
         let trimmed = album.name.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        // reject empty names
-        guard !trimmed.isEmpty else { return false }
-
-        // reject symbol-only names (common parsing failures)
-        let invalidNames: Set<String> = ["+", "?", "…", "•", "–", "—", "-", "*", "/", "\\"]
-        guard !invalidNames.contains(trimmed) else { return false }
-
-        // reject names that are entirely symbols/whitespace/punctuation
-        let hasLetterOrNumber = trimmed.contains { $0.isLetter || $0.isNumber }
-        guard hasLetterOrNumber else { return false }
-
-        return true
-    }
-
-    /// Creates a normalized key for deduplication (case/diacritic insensitive)
-    static func normalizedKey(for album: Album) -> String {
-        let name = album.name
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
-
-        let artist = album.artist
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .folding(options: [.diacriticInsensitive, .caseInsensitive], locale: .current)
-
-        return "\(name)|\(artist)"
+        // Symbol-only titles are valid release names, not parsing-failure proof.
+        return !trimmed.isEmpty
     }
 
     /// Scores album metadata completeness - higher = better

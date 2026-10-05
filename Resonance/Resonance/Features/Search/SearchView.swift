@@ -7,11 +7,15 @@ import SwiftUI
 final class RecentSearchesManager {
     private let maxItems = 10
     private let userDefaultsKey = "recentSearches"
+    private let persistenceEnabled: Bool
 
     var recentSearches: [String] = []
 
-    init() {
-        loadFromDefaults()
+    init(persistenceEnabled: Bool = !DeterministicCaptureFixture.isEnabled) {
+        self.persistenceEnabled = persistenceEnabled
+        if persistenceEnabled {
+            loadFromDefaults()
+        }
     }
 
     func addSearch(_ query: String) {
@@ -47,6 +51,7 @@ final class RecentSearchesManager {
     }
 
     private func saveToDefaults() {
+        guard persistenceEnabled else { return }
         UserDefaults.standard.set(recentSearches, forKey: userDefaultsKey)
     }
 }
@@ -58,25 +63,12 @@ private enum SearchScope: String, CaseIterable {
     case global = "Global"
 }
 
-private struct SearchResultCounts {
-    var artists = 0
-    var albums = 0
-    var songs = 0
-
-    var total: Int {
-        artists + albums + songs
-    }
-}
-
 struct SearchView: View {
     @Environment(AppState.self) private var appState
-    @State private var results: SearchResults?
-    @State private var unfilteredResultCounts = SearchResultCounts()
-    @State private var isSearching = false
-    @State private var searchError: ResonanceError?
-    @State private var searchTask: Task<Void, Never>?
+    @State private var pagingStore = SearchPagingStore()
     @State private var recentSearchesManager = RecentSearchesManager()
     @State private var searchScope: SearchScope = .library
+    @FocusState private var isSearchFocused: Bool
 
     // Expanded section states
     @State private var showAllArtists = false
@@ -93,20 +85,39 @@ struct SearchView: View {
 
     private let displayLimit = 5
 
+    private var trimmedQuery: String {
+        appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private var paging: SearchPaging { pagingStore.paging }
+
+    private var matchedPlaylists: [Playlist] {
+        guard pagingStore.hasCompletedInitialRequest, !trimmedQuery.isEmpty else { return [] }
+        let normalizedQuery = trimmedQuery.lowercased()
+        return appState.playlists
+            .filter { $0.name.lowercased().contains(normalizedQuery) }
+            .sorted { lhs, rhs in
+                let lhsPrefix = lhs.name.lowercased().hasPrefix(normalizedQuery)
+                let rhsPrefix = rhs.name.lowercased().hasPrefix(normalizedQuery)
+                if lhsPrefix != rhsPrefix { return lhsPrefix }
+                return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+            }
+    }
+
     var body: some View {
         VStack(spacing: 0) {
-            // Search field
-            searchField
-
             // Content
-            if isSearching {
+            if trimmedQuery.isEmpty {
+                emptyStateView
+            } else if pagingStore.isInitialLoading {
                 InlineLoadingStatusView(title: "Searching...")
                     .padding(.horizontal, 24)
                     .padding(.top, 18)
-            } else if let error = searchError {
+            } else if let error = pagingStore.initialError {
                 searchErrorView(error)
-            } else if let results {
-                if results.isEmpty {
+            } else if pagingStore.hasCompletedInitialRequest {
+                let results = visibleResults(pagingStore.rawResults)
+                if results.isEmpty && matchedPlaylists.isEmpty && !paging.hasMore {
                     noResultsView
                 } else {
                     searchResultsView(results)
@@ -115,7 +126,17 @@ struct SearchView: View {
                 emptyStateView
             }
         }
-        .navigationTitle("Search")
+        .navigationTitle("")
+        .toolbar {
+            ToolbarItem(placement: .principal) { searchField }
+            ToolbarItem(placement: .primaryAction) { searchScopePicker }
+        }
+        .onChange(of: appState.shouldFocusSearch) { _, requested in
+            if requested { focusSearch() }
+        }
+        .onAppear {
+            if appState.shouldFocusSearch { focusSearch() }
+        }
         .navigationDestination(for: Artist.self) { artist in
             ArtistDetailView(artist: artist)
         }
@@ -123,84 +144,88 @@ struct SearchView: View {
             AlbumDetailView(album: album)
         }
         .onChange(of: appState.searchQuery) {
-            // Reset expanded states when query changes
-            showAllArtists = false
-            showAllAlbums = false
-            showAllSongs = false
-
-            // Debounce search input
-            searchTask?.cancel()
-
-            // Clear results immediately if query is empty
-            if appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                results = nil
-                searchError = nil
-                return
-            }
-
-            searchTask = Task {
-                try? await Task.sleep(for: .milliseconds(300))
-                guard !Task.isCancelled else { return }
-                await performSearch()
-            }
+            resetExpandedSections()
+            beginSearch(debounce: trimmedQuery.isEmpty ? nil : .milliseconds(300))
         }
         .onChange(of: searchScope) {
-            guard !appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-            searchTask?.cancel()
-            Task {
-                await performSearch()
-            }
+            resetExpandedSections()
+            beginSearch()
+        }
+        .task(id: appState.activeServerId) {
+            // A parity route can seed AppState before this view exists, so an
+            // initial non-empty query does not produce an onChange event.
+            // Treat it exactly like submitted production search text. A server
+            // change also invalidates every offset and in-flight response.
+            resetExpandedSections()
+            beginSearch()
+        }
+        .onChange(of: pagingStore.completedInitialIdentity) { _, completed in
+            guard completed == pagingStore.identity else { return }
+            recentSearchesManager.addSearch(completed?.query ?? "")
+        }
+        .onDisappear {
+            pagingStore.cancel()
         }
     }
 
     // MARK: - Search Field
 
+    private func focusSearch() {
+        isSearchFocused = true
+        appState.shouldFocusSearch = false
+    }
+
     private var searchField: some View {
-        VStack(spacing: 10) {
-            HStack {
-                Image(systemName: "magnifyingglass")
-                    .foregroundStyle(.secondary)
-
-                TextField("Search artists, albums, songs...", text: query)
-                    .textFieldStyle(.plain)
-                    .onSubmit {
-                        searchTask?.cancel()
-                        Task {
-                            await performSearch()
-                            if !appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                                recentSearchesManager.addSearch(appState.searchQuery)
-                            }
-                        }
-                    }
-
-                if !query.wrappedValue.isEmpty {
-                    Button {
-                        query.wrappedValue = ""
-                        results = nil
-                        searchError = nil
-                        searchTask?.cancel()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundStyle(.secondary)
-                    }
-                    .buttonStyle(.plain)
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search", text: query)
+                .textFieldStyle(.plain)
+                .focused($isSearchFocused)
+                .accessibilityIdentifier("Search.Query")
+                .onSubmit {
+                    resetExpandedSections()
+                    beginSearch()
                 }
-            }
-            .padding()
-            .background(.quaternary)
-            .cornerRadius(10)
-
-            Picker("Scope", selection: $searchScope) {
-                ForEach(SearchScope.allCases, id: \.self) { scope in
-                    Text(scope.rawValue).tag(scope)
+                .onExitCommand {
+                    query.wrappedValue = ""
+                    isSearchFocused = false
                 }
+            if !query.wrappedValue.isEmpty {
+                Button {
+                    query.wrappedValue = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel("Clear search")
+                .accessibilityIdentifier("Search.Clear")
             }
-            .pickerStyle(.segmented)
-            .frame(maxWidth: 260)
         }
-        .padding(.horizontal, 24)
-        .padding(.top, 20)
-        .padding(.bottom, 16)
+        .font(.system(size: 13))
+        .padding(.horizontal, 12)
+        // Native Search Response_4 field 0x7b3c085880 is597×36, font13.
+        // Allow toolbar compression; its narrow-window rule is not captured.
+        .frame(minWidth: 180, idealWidth: 597, maxWidth: 597)
+        .frame(height: 36)
+        .background(.quaternary, in: Capsule())
+    }
+
+    private var searchScopePicker: some View {
+        Picker("Search scope", selection: $searchScope) {
+            ForEach(SearchScope.allCases, id: \.self) { scope in
+                Text(scope.rawValue).tag(scope)
+            }
+        }
+        .labelsHidden()
+        .pickerStyle(.segmented)
+        .font(.system(size: 13))
+        .frame(width: 163, height: 36)
+        .help(searchScope == .library
+            ? "Search only items admitted to your library"
+            : "Search the server's full library")
+        .accessibilityIdentifier("Search.Scope")
     }
 
     // MARK: - Empty State (no query)
@@ -284,9 +309,7 @@ struct SearchView: View {
             message: searchErrorMessage(error),
             actionTitle: "Retry",
             actionSystemImage: "arrow.clockwise",
-            action: {
-                Task { await performSearch() }
-            }
+            action: pagingStore.retry
         )
         .padding(.horizontal, 24)
         .padding(.top, 18)
@@ -295,7 +318,7 @@ struct SearchView: View {
 
     private var noResultsView: some View {
         ScrollView {
-            let hasGlobalMatches = searchScope == .library && unfilteredResultCounts.total > 0
+            let hasGlobalMatches = searchScope == .library && !pagingStore.rawResults.isEmpty
             Group {
                 if hasGlobalMatches {
                     CompactStatusView(
@@ -346,9 +369,83 @@ struct SearchView: View {
                 if !results.songs.isEmpty {
                     songsSection(results.songs)
                 }
+
+                // Playlists (server-synced collections, matched locally)
+                if !matchedPlaylists.isEmpty {
+                    playlistsSection(matchedPlaylists)
+                }
+
+                emptyFacetContinuationControls(results)
+
+                if let moreError = pagingStore.moreError {
+                    HStack {
+                        Text(searchErrorMessage(moreError)).foregroundStyle(.secondary)
+                        Button("Try Again", action: pagingStore.retry)
+                            .disabled(pagingStore.isLoadingMore)
+                    }
+                }
             }
-            .padding(24)
+            // Captured catalog search: Response_4, 0x7b39ffb980.frame
+            // and 0x7b39ff9b80.frame both start 34pt into their shelves.
+            .padding(.horizontal, 34)
+            .padding(.vertical, 24)
             .frame(maxWidth: .infinity, alignment: .topLeading)
+        }
+    }
+
+    @ViewBuilder
+    private func emptyFacetContinuationControls(_ results: SearchResults) -> some View {
+        let needsArtists = results.artists.isEmpty && paging.hasMoreArtists
+        let needsAlbums = results.albums.isEmpty && paging.hasMoreAlbums
+        let needsSongs = results.songs.isEmpty && paging.hasMoreSongs
+        if needsArtists || needsAlbums || needsSongs {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("More matches may be available")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                HStack(spacing: 8) {
+                    if needsArtists {
+                        continuationButton(title: "Continue Artists", facet: .artists)
+                    }
+                    if needsAlbums {
+                        continuationButton(title: "Continue Albums", facet: .albums)
+                    }
+                    if needsSongs {
+                        continuationButton(title: "Continue Songs", facet: .songs)
+                    }
+                    if pagingStore.isLoadingMore {
+                        ProgressView().controlSize(.small)
+                    }
+                }
+            }
+        }
+    }
+
+    private func continuationButton(title: String, facet: SearchPaging.Facets) -> some View {
+        Button(title) { pagingStore.loadMore(facet) }
+            .buttonStyle(.bordered)
+            .disabled(pagingStore.isLoadingMore)
+    }
+
+    private func facetPagingControl(
+        title: String,
+        loadedCount: Int,
+        facet: SearchPaging.Facets,
+        hasMore: Bool
+    ) -> some View {
+        HStack(spacing: 10) {
+            Text("\(loadedCount) \(title) loaded")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            if hasMore {
+                Button("More") { pagingStore.loadMore(facet) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(pagingStore.isLoadingMore)
+            }
+            if pagingStore.isLoadingMore {
+                ProgressView().controlSize(.small)
+            }
         }
     }
 
@@ -356,7 +453,9 @@ struct SearchView: View {
 
     private func topResultsSection(_ results: SearchResults) -> some View {
         SearchResultSection(title: "Top Results") {
-            HStack(alignment: .top, spacing: 16) {
+            // Captured top results have two 80pt rows, at y47 and y147.
+            ScrollView(.horizontal) {
+                LazyHGrid(rows: [GridItem(.fixed(80), spacing: 20), GridItem(.fixed(80))], alignment: .top, spacing: 20) {
                 // Top Artist
                 if let artist = results.artists.first {
                     NavigationLink(value: artist) {
@@ -385,7 +484,7 @@ struct SearchView: View {
                     .buttonStyle(.plain)
                 }
 
-                Spacer()
+            }
             }
         }
     }
@@ -394,50 +493,80 @@ struct SearchView: View {
 
     private func artistsSection(_ artists: [Artist]) -> some View {
         let displayedArtists = showAllArtists ? artists : Array(artists.prefix(displayLimit))
-        let hasMore = artists.count > displayLimit
+        let hasMore = artists.count > displayLimit || paging.hasMoreArtists
 
         return SearchResultSection(
             title: "Artists",
             showSeeAll: hasMore && !showAllArtists,
-            onSeeAll: { showAllArtists = true }
+            onSeeAll: {
+                showAllArtists = true
+                pagingStore.loadMore(.artists)
+            }
         ) {
-            ForEach(displayedArtists) { artist in
-                NavigationLink(value: artist) {
-                    ArtistRow(artist: artist)
+            VStack(alignment: .leading, spacing: 10) {
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: 20) {
+                        ForEach(displayedArtists) { artist in
+                        NavigationLink(value: artist) {
+                            VStack(alignment: .center, spacing: 12) {
+                                // Native search artist focus/artwork bounds are 172pt square
+                                // (Response_4, 0x7b39ff9b80.frame).
+                                ArtistImageView(artistId: artist.id, coverArt: artist.coverArt)
+                                .frame(width: 172, height: 172)
+
+                                VStack(alignment: .center, spacing: 2) {
+                                    Text(artist.name)
+                                    .font(.body)
+                                    .fontWeight(.medium)
+                                    .lineLimit(1)
+                                }
+                            }
+                            .frame(width: 172, alignment: .center)
+                        }
+                        .buttonStyle(.plain)
+                        .contextMenu {
+                            Button {
+                                Task {
+                                    await playArtist(artist)
+                                }
+                            } label: {
+                                Label("Play", systemImage: "play")
+                            }
+
+                            Button {
+                                Task {
+                                    await playArtist(artist, shuffled: true)
+                                }
+                            } label: {
+                                Label("Shuffle", systemImage: "shuffle")
+                            }
+
+                            Button {
+                                Task {
+                                    await addArtistToQueue(artist)
+                                }
+                            } label: {
+                                Label("Add to Queue", systemImage: "text.badge.plus")
+                            }
+
+                            Divider()
+
+                            Button {
+                                appState.getInfoContent = .artist(artist)
+                            } label: {
+                                Label("Get Info", systemImage: "info.circle")
+                            }
+                        }
+                        }
+                    }
                 }
-                .buttonStyle(.plain)
-                .contextMenu {
-                    Button {
-                        Task {
-                            await playArtist(artist)
-                        }
-                    } label: {
-                        Label("Play", systemImage: "play")
-                    }
-
-                    Button {
-                        Task {
-                            await playArtist(artist, shuffled: true)
-                        }
-                    } label: {
-                        Label("Shuffle", systemImage: "shuffle")
-                    }
-
-                    Button {
-                        Task {
-                            await addArtistToQueue(artist)
-                        }
-                    } label: {
-                        Label("Add to Queue", systemImage: "text.badge.plus")
-                    }
-
-                    Divider()
-
-                    Button {
-                        appState.getInfoContent = .artist(artist)
-                    } label: {
-                        Label("Get Info", systemImage: "info.circle")
-                    }
+                if showAllArtists {
+                    facetPagingControl(
+                        title: "artists",
+                        loadedCount: artists.count,
+                        facet: .artists,
+                        hasMore: paging.hasMoreArtists
+                    )
                 }
             }
         }
@@ -447,52 +576,79 @@ struct SearchView: View {
 
     private func albumsSection(_ albums: [Album]) -> some View {
         let displayedAlbums = showAllAlbums ? albums : Array(albums.prefix(displayLimit))
-        let hasMore = albums.count > displayLimit
+        let hasMore = albums.count > displayLimit || paging.hasMoreAlbums
 
         return SearchResultSection(
             title: "Albums",
             showSeeAll: hasMore && !showAllAlbums,
-            onSeeAll: { showAllAlbums = true }
+            onSeeAll: {
+                showAllAlbums = true
+                pagingStore.loadMore(.albums)
+            }
         ) {
-            LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], spacing: 16) {
-                ForEach(displayedAlbums) { album in
-                    NavigationLink(value: album) {
-                        AlbumCard(album: album)
+            // Native catalog results use a horizontal 200pt artwork shelf,
+            // not an adaptive multi-row album grid (Response_4,
+            // 0x7b39ffb980.frame and 0x7b39844f00.frame).
+            VStack(alignment: .leading, spacing: 10) {
+                ScrollView(.horizontal) {
+                    LazyHStack(alignment: .top, spacing: 20) {
+                        ForEach(displayedAlbums) { album in
+                        AlbumCardActionSurface(
+                            album: album,
+                            onPlay: { Task { await playAlbum(album) } }
+                        ) { artworkHoverChanged in
+                            NavigationLink(value: album) {
+                                AlbumCard(
+                                    album: album,
+                                    showsHoverPlayButton: false,
+                                    onArtworkHoverChange: artworkHoverChanged
+                                )
+                            }
+                            .buttonStyle(.plain)
+                        }
+                        .contextMenu {
+                            Button {
+                                Task {
+                                    await playAlbum(album)
+                                }
+                            } label: {
+                                Label("Play", systemImage: "play")
+                            }
+
+                            Button {
+                                Task {
+                                    await playAlbum(album, shuffled: true)
+                                }
+                            } label: {
+                                Label("Shuffle", systemImage: "shuffle")
+                            }
+
+                            Button {
+                                Task {
+                                    await addAlbumToQueue(album)
+                                }
+                            } label: {
+                                Label("Add to Queue", systemImage: "text.badge.plus")
+                            }
+
+                            Divider()
+
+                            Button {
+                                appState.getInfoContent = .album(album)
+                            } label: {
+                                Label("Get Info", systemImage: "info.circle")
+                            }
+                        }
+                        }
                     }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        Button {
-                            Task {
-                                await playAlbum(album)
-                            }
-                        } label: {
-                            Label("Play", systemImage: "play")
-                        }
-
-                        Button {
-                            Task {
-                                await playAlbum(album, shuffled: true)
-                            }
-                        } label: {
-                            Label("Shuffle", systemImage: "shuffle")
-                        }
-
-                        Button {
-                            Task {
-                                await addAlbumToQueue(album)
-                            }
-                        } label: {
-                            Label("Add to Queue", systemImage: "text.badge.plus")
-                        }
-
-                        Divider()
-
-                        Button {
-                            appState.getInfoContent = .album(album)
-                        } label: {
-                            Label("Get Info", systemImage: "info.circle")
-                        }
-                    }
+                }
+                if showAllAlbums {
+                    facetPagingControl(
+                        title: "albums",
+                        loadedCount: albums.count,
+                        facet: .albums,
+                        hasMore: paging.hasMoreAlbums
+                    )
                 }
             }
         }
@@ -502,100 +658,114 @@ struct SearchView: View {
 
     private func songsSection(_ songs: [Song]) -> some View {
         let displayedSongs = showAllSongs ? songs : Array(songs.prefix(displayLimit))
-        let hasMore = songs.count > displayLimit
+        let hasMore = songs.count > displayLimit || paging.hasMoreSongs
 
         return SearchResultSection(
             title: "Songs",
             showSeeAll: hasMore && !showAllSongs,
-            onSeeAll: { showAllSongs = true }
+            onSeeAll: {
+                showAllSongs = true
+                pagingStore.loadMore(.songs)
+            }
         ) {
-            ForEach(displayedSongs) { song in
-                SongRow(song: song, showTrackNumber: false)
-                    .onTapGesture(count: 2) {
-                        Task {
-                            await appState.playbackManager.playNow(song)
+            // Response_4: three song rows advance by 56pt; adjacent columns
+            // start at x34 and x473, with 419pt-wide row focus bounds.
+            VStack(alignment: .leading, spacing: 10) {
+                ScrollView(.horizontal) {
+                    LazyHGrid(rows: Array(repeating: GridItem(.fixed(56), spacing: 0), count: 3), spacing: 20) {
+                        ForEach(Array(displayedSongs.enumerated()), id: \.element.id) { index, song in
+                        SearchSongResultRow(
+                            song: song,
+                            showsSeparator: index % 3 < 2 && index + 1 < displayedSongs.count
+                        )
+                        .onTapGesture(count: 2) {
+                            Task {
+                                await appState.playbackManager.playNow(song)
+                            }
+                        }
+                        .contextMenu {
+                            SongContextMenu(song: song)
+                        }
                         }
                     }
-                    .contextMenu {
-                        SongContextMenu(song: song)
-                    }
+                    .frame(height: 174, alignment: .top)
+                }
+                if showAllSongs {
+                    facetPagingControl(
+                        title: "songs",
+                        loadedCount: songs.count,
+                        facet: .songs,
+                        hasMore: paging.hasMoreSongs
+                    )
+                }
+            }
+        }
+    }
+
+    // MARK: - Playlists Section
+
+    private func playlistsSection(_ playlists: [Playlist]) -> some View {
+        SearchResultSection(title: "Playlists") {
+            ForEach(playlists) { playlist in
+                NavigationLink(value: playlist) {
+                    PlaylistRow(playlist: playlist)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    PlaylistContextMenu(playlist: playlist)
+                }
             }
         }
     }
 
     // MARK: - Search
 
-    private func performSearch() async {
-        let trimmedQuery = appState.searchQuery.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmedQuery.isEmpty else {
-            results = nil
-            searchError = nil
-            unfilteredResultCounts = SearchResultCounts()
-            return
-        }
+    private func resetExpandedSections() {
+        showAllArtists = false
+        showAllAlbums = false
+        showAllSongs = false
+    }
 
-        isSearching = true
-        searchError = nil
-
-        do {
-            var searchResults = try await appState.networkActor.search(
-                query: trimmedQuery,
-                artistCount: 20,
-                albumCount: 20,
-                songCount: 30
-            )
-            unfilteredResultCounts = SearchResultCounts(
-                artists: searchResults.artists.count,
-                albums: searchResults.albums.count,
-                songs: searchResults.songs.count
-            )
-
-            // Filter out hidden items, then apply the explicit library/global boundary.
-            if let serverId = appState.activeServerId {
-                let hiddenAlbumIds = (try? appState.databaseManager.loadHiddenIds(type: "album", serverId: serverId)) ?? []
-                let hiddenArtistIds = (try? appState.databaseManager.loadHiddenIds(type: "artist", serverId: serverId)) ?? []
-                let hiddenSongIds = (try? appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId)) ?? []
-                let admittedAlbumIds = searchScope == .library
-                    ? ((try? appState.databaseManager.loadLibraryMemberIds(type: .album, serverId: serverId)) ?? [])
-                    : []
-                let admittedArtistIds = searchScope == .library
-                    ? ((try? appState.databaseManager.loadLibraryMemberIds(type: .artist, serverId: serverId)) ?? [])
-                    : []
-                let admittedSongIds = searchScope == .library
-                    ? ((try? appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: serverId)) ?? [])
-                    : []
-
-                searchResults = SearchResults(
-                    artists: searchResults.artists.filter {
-                        !hiddenArtistIds.contains($0.id) &&
-                        (searchScope == .global || admittedArtistIds.contains($0.id))
-                    },
-                    albums: searchResults.albums.filter {
-                        !hiddenAlbumIds.contains($0.id) &&
-                        (searchScope == .global || admittedAlbumIds.contains($0.id))
-                    },
-                    songs: searchResults.songs.filter {
-                        !hiddenSongIds.contains($0.id) &&
-                        (searchScope == .global || admittedSongIds.contains($0.id))
-                    }
-                )
+    private func beginSearch(debounce: Duration? = nil) {
+        let query = trimmedQuery
+        let scope = searchScope.rawValue.lowercased()
+        let serverID = appState.activeServerId ?? ""
+        pagingStore.begin(
+            query: query,
+            scope: scope,
+            serverID: serverID,
+            debounce: debounce
+        ) { request in
+            guard let expectedServerID = UUID(uuidString: request.identity.serverID) else {
+                throw ResonanceError.notConfigured
             }
-
-            results = searchResults
-
-            // Save successful search to recent searches
-            recentSearchesManager.addSearch(trimmedQuery)
-        } catch let error as ResonanceError {
-            searchError = error
-            results = nil
-            unfilteredResultCounts = SearchResultCounts()
-        } catch {
-            searchError = .networkError(error)
-            results = nil
-            unfilteredResultCounts = SearchResultCounts()
+            let facets = request.facets
+            return try await appState.networkActor.search(
+                query: request.identity.query,
+                artistCount: facets.contains(.artists) ? 100 : 0,
+                albumCount: facets.contains(.albums) ? 100 : 0,
+                songCount: facets.contains(.songs) ? 100 : 0,
+                artistOffset: request.artistOffset,
+                albumOffset: request.albumOffset,
+                songOffset: request.songOffset,
+                expectedServerID: expectedServerID
+            )
         }
+    }
 
-        isSearching = false
+    private func visibleResults(_ raw: SearchResults) -> SearchResults {
+        // Establish an Observation dependency even when a publication happens
+        // to replace an admitted-ID set with an equal value.
+        _ = appState.libraryMembershipRevision
+        return SearchResultVisibility(
+            libraryOnly: searchScope == .library,
+            admittedArtistIDs: appState.admittedArtistIds,
+            admittedAlbumIDs: appState.admittedAlbumIds,
+            admittedSongIDs: appState.admittedSongIds,
+            hiddenArtistIDs: appState.hiddenArtistIds,
+            hiddenAlbumIDs: appState.hiddenAlbumIds,
+            hiddenSongIDs: appState.hiddenSongIds
+        ).project(raw)
     }
 
     private func playArtist(_ artist: Artist, shuffled: Bool = false) async {
@@ -624,16 +794,36 @@ struct SearchView: View {
     }
 
     private func playAlbum(_ album: Album, shuffled: Bool = false) async {
+        let serverIdentity = (
+            id: appState.activeServer?.id,
+            url: appState.activeServer?.url,
+            username: appState.activeServer?.username
+        )
         do {
             var songs = try await loadPlayableSongs(for: album)
+            guard !Task.isCancelled,
+                  appState.activeServer?.id == serverIdentity.id,
+                  appState.activeServer?.url == serverIdentity.url,
+                  appState.activeServer?.username == serverIdentity.username else { return }
             if shuffled {
                 songs.shuffle()
             }
             if !songs.isEmpty {
                 await appState.playbackManager.play(songs: songs)
             }
+        } catch is CancellationError {
+            // Server changes invalidate the active result fetch.
         } catch {
-            print("Failed to play album from search: \(error)")
+            guard !Task.isCancelled,
+                  appState.activeServer?.id == serverIdentity.id,
+                  appState.activeServer?.url == serverIdentity.url,
+                  appState.activeServer?.username == serverIdentity.username else { return }
+            appState.showFeedback(
+                message: "Couldn't play \(album.name)",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "exclamationmark.triangle"
+            )
         }
     }
 
@@ -723,10 +913,67 @@ struct SearchResultSection<Content: View>: View {
     }
 }
 
+// MARK: - Search Song Result
+
+private struct SearchSongResultRow: View {
+    let song: Song
+    let showsSeparator: Bool
+
+    var body: some View {
+        // Native Response_4 layers: 0x7b3c65af40 artwork,
+        // 0x7b3d5951f0 / 0x7b3d595260 text, 0x7b4fb12a00 menu.
+        // Text bounds are raster extents, not evidence of point size/weight.
+        ZStack(alignment: .topLeading) {
+            EnvironmentAlbumArtView(coverArtId: song.coverArt, size: .small)
+                .frame(width: 48, height: 48)
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+
+            Text(song.title)
+                .font(.body)
+                .lineLimit(1)
+                .frame(width: 311, height: 16, alignment: .leading)
+                .offset(x: 60, y: 8)
+
+            Text(song.artist)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 311, height: 16, alignment: .leading)
+                .offset(x: 60, y: 24)
+
+            Menu {
+                SongContextMenu(song: song)
+            } label: {
+                Image(systemName: "ellipsis")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .frame(width: 20, height: 14)
+            .offset(x: 389, y: 17)
+            .accessibilityLabel("More actions for \(song.title)")
+
+            if showsSeparator {
+                // 0x7b3c65a520: [359,1] at [94,52], artwork origin x34.
+                Rectangle()
+                    .fill(Color(nsColor: .separatorColor))
+                    .frame(width: 359, height: 1)
+                    .offset(x: 60, y: 52)
+            }
+        }
+        .frame(width: 419, height: 56, alignment: .topLeading)
+        .contentShape(Rectangle())
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(song.title) by \(song.artist), \(song.formattedDuration)\(song.isExplicit ? ", explicit" : "")")
+        .accessibilityHint("Double-click to play; open More Actions for song commands")
+        .help("\(song.title) — \(song.artist) — \(song.formattedDuration)")
+    }
+}
+
 // MARK: - Top Result Card
 
 struct TopResultCard: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.colorScheme) private var colorScheme
 
     let title: String
     let subtitle: String
@@ -735,11 +982,12 @@ struct TopResultCard: View {
     let isCircular: Bool
 
     @State private var image: NSImage?
-    @State private var isHovered = false
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            // Cover art
+        // Native catalog-search Response_4: card 0x7b3c7d7b20,
+        // artwork 0x7b3c7d7fe0, title/subtitle 0x7b3d596e60 / 0x7b3d594380.
+        // Their layer anchors are zero, so these are card-local top-left offsets.
+        ZStack(alignment: .topLeading) {
             Group {
                 if let image {
                     Image(nsImage: image)
@@ -755,34 +1003,44 @@ struct TopResultCard: View {
                         }
                 }
             }
-            .frame(width: 120, height: 120)
-            .clipShape(isCircular ? AnyShape(Circle()) : AnyShape(RoundedRectangle(cornerRadius: 8)))
+            .frame(width: 42, height: 42)
+            .clipShape(isCircular ? AnyShape(Circle()) : AnyShape(RoundedRectangle(cornerRadius: 4)))
+            .offset(x: 14, y: 19)
 
-            // Info
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.headline)
-                    .lineLimit(2)
+            // The capture exposes raster drawing bounds, not font descriptors.
+            // Retain existing semantic fonts; do not infer point sizes from pixels.
+            Text(title)
+                .font(.headline)
+                .lineLimit(1)
+                .frame(width: 192, height: 19, alignment: .leading)
+                .offset(x: 68, y: 22)
 
-                Text(subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
+            Text(subtitle)
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+                .frame(width: 192, height: 15, alignment: .leading)
+                .offset(x: 68, y: 43)
+
+            Image(systemName: "chevron.right")
+                .resizable()
+                .frame(width: 5, height: 9)
+                .foregroundStyle(.secondary)
+                .offset(x: 276, y: 36)
+                .accessibilityHidden(true)
+        }
+        .frame(width: 292, height: 80, alignment: .topLeading)
+        .background {
+            // Only dark is evidenced; retain the existing material in light.
+            if colorScheme == .dark {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(Color(.sRGB, red: 53 / 255, green: 53 / 255, blue: 53 / 255))
+            } else {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(.ultraThinMaterial)
             }
         }
-        .frame(width: 140)
-        .padding(12)
-        .background {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(.ultraThinMaterial)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 12)
-                        .stroke(.white.opacity(isHovered ? 0.15 : 0.08), lineWidth: 0.5)
-                )
-        }
-        .scaleEffect(isHovered ? 1.02 : 1.0)
-        .animation(.easeOut(duration: 0.15), value: isHovered)
-        .onHover { isHovered = $0 }
+        .contentShape(RoundedRectangle(cornerRadius: 10))
         .task(id: coverArtId) {
             await loadImage()
         }

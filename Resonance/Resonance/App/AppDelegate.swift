@@ -7,14 +7,30 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     weak var appState: AppState?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Capture fixtures are intentionally inert at the process boundary.
+        // Registering MediaPlayer commands or publishing Now Playing state
+        // would leak a visual-only launch into the user's system media state.
+        guard !DeterministicCaptureFixture.isEnabled else {
+            print("[ParityFixture] mediaCommands=disabled nowPlayingPublishing=disabled")
+            return
+        }
+
         setupMediaKeyHandling()
         setupNowPlayingInfo()
 
         // Handle "Start Minimized" setting
-        if UserDefaults.standard.bool(forKey: "startMinimized") {
-            // Hide the main window after a brief delay to let it initialize
+        let isBackgroundNormalSmoke = ProcessInfo.processInfo.environment[
+            "RESONANCE_NORMAL_SMOKE_BACKGROUND"
+        ] == "1"
+        if isBackgroundNormalSmoke {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                NSApplication.shared.windows.first { $0.title != "" && $0.isVisible }?.orderOut(nil)
+                NSApplication.shared.windows.first?.orderBack(nil)
+            }
+        } else if UserDefaults.standard.bool(forKey: "startMinimized") {
+            // Minimize the main window after a brief delay to let it initialize.
+            // Hiding it leaves no minimized Dock window to restore.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                NSApplication.shared.windows.first { $0.title != "" && $0.isVisible }?.miniaturize(nil)
             }
         }
     }
@@ -194,6 +210,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Fixture databases are isolated, but keep this guard as a second
+        // boundary: fixture shutdown must never honor a persisted destructive
+        // preference or perform cleanup intended for the production store.
+        guard !DeterministicCaptureFixture.isEnabled else { return }
+
+        // Save the paused, server-scoped base queue before any optional history
+        // cleanup. Up-next entries remain intentionally ephemeral.
+        appState?.persistState()
+
         // Clear play history if setting is enabled
         if UserDefaults.standard.bool(forKey: "clearHistoryOnQuit") {
             try? appState?.databaseManager.write { db in

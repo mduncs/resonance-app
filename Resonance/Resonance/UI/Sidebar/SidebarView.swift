@@ -1,14 +1,6 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
-// MARK: - Group Kind
-
-enum SidebarGroupKind: Int {
-    case regular = 0      // Standard items (Home, Songs, Albums, etc.)
-    case library = 1      // Library section header
-    case playlists = 2    // Playlists section
-    case pins = 3         // Pinned items section
-}
 
 // MARK: - Main Sidebar View
 
@@ -33,14 +25,23 @@ struct SidebarView: View {
     @AppStorage("showSidebarRecentlyAdded") private var showRecentlyAdded = true
     @AppStorage("showSidebarDownloads") private var showDownloads = true
     @AppStorage("showSidebarRadio") private var showRadio = true
-    @AppStorage(FetcherContractSettings.isEnabledKey) private var enableFetcherSourceBrowser = false
     @AppStorage("enableOnePlane") private var enableOnePlane = false
 
     // Collapsed sections persistence (stored as comma-separated string for AppStorage)
     @AppStorage("sidebarCollapsedGroups") private var collapsedGroupsString: String = ""
 
     // Sidebar width persistence
-    @AppStorage("sidebarWidth") private var sidebarWidth: Double = 200
+    @AppStorage("sidebarWidth") private var sidebarWidth: Double = 213
+
+    private var forcesAtlasVisibility: Bool {
+        ProcessInfo.processInfo.environment["RESONANCE_PARITY_FIXTURE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "atlas"
+    }
+
+    private func isVisible(_ storedValue: Bool) -> Bool {
+        forcesAtlasVisibility || storedValue
+    }
 
     private var collapsedGroups: Set<String> {
         get {
@@ -49,6 +50,7 @@ struct SidebarView: View {
     }
 
     private func toggleSection(_ section: String) {
+        guard !forcesAtlasVisibility else { return }
         var groups = collapsedGroups
         if groups.contains(section) {
             groups.remove(section)
@@ -59,33 +61,30 @@ struct SidebarView: View {
     }
 
     private func isCollapsed(_ section: String) -> Bool {
-        collapsedGroups.contains(section)
+        !forcesAtlasVisibility && collapsedGroups.contains(section)
     }
 
     private var visibleLibraryItems: [SidebarItem] {
         var items: [SidebarItem] = []
-        if showArtists { items.append(.artists) }
-        if showAlbums { items.append(.albums) }
-        if showSongs { items.append(.songs) }
-        if showGenres { items.append(.genres) }
-        if showFolders { items.append(.folders) }
+        if isVisible(showArtists) { items.append(.artists) }
+        if isVisible(showAlbums) { items.append(.albums) }
+        if isVisible(showSongs) { items.append(.songs) }
+        if isVisible(showGenres) { items.append(.genres) }
+        if isVisible(showFolders) { items.append(.folders) }
         return items
     }
 
     private var allSidebarItemsHidden: Bool {
-        !showHome && !showArtists && !showAlbums && !showSongs && !showGenres &&
-        !showFolders && !showFavorites && !showRecentlyPlayed && !showNewMusic && !showRecentlyAdded &&
-        !showDownloads && !showRadio && !showListen && !showWaitingRoom &&
-        !showProjects && !showUnclassified &&
-        !enableFetcherSourceBrowser && !enableOnePlane
+        // Public playlist discovery is an always-visible destination.
+        false
     }
 
     var body: some View {
         @Bindable var state = appState
 
         VStack(spacing: 0) {
-            // Search field at very top
-            SidebarSearchField()
+            // Search navigation; the query belongs in the detail toolbar.
+            SidebarSearchNavigation()
                 .padding(.horizontal, 12)
                 .padding(.top, 8)
                 .padding(.bottom, 4)
@@ -113,7 +112,14 @@ struct SidebarView: View {
             }
         }
         .background(.ultraThinMaterial)
-        .frame(minWidth: 180, idealWidth: sidebarWidth)
+        .frame(minWidth: 210)
+        // A frame's idealWidth is not the NavigationSplitView allocation.
+        // Native state 50 allocates 213 points to this split item; preserve
+        // normal-mode user widths, but establish that measured initial width.
+        .navigationSplitViewColumnWidth(
+            min: 210,
+            ideal: forcesAtlasVisibility ? 213 : max(210, sidebarWidth)
+        )
         .safeAreaInset(edge: .bottom, spacing: 0) {
             SidebarFooter()
         }
@@ -142,6 +148,7 @@ struct SidebarView: View {
             Spacer()
         }
         .frame(maxWidth: .infinity)
+        .accessibilityIdentifier("sidebar-empty-state")
     }
 
     // MARK: - Top Level Items
@@ -149,104 +156,98 @@ struct SidebarView: View {
     @ViewBuilder
     private var topLevelItemsSection: some View {
         Group {
-            if showListen {
+            if isVisible(showListen) {
                 SidebarItemCell(
                     label: "Listen",
                     icon: "play.circle.fill",
-                    item: .listen,
-                    selection: appState.selectedSidebarItem
+                    item: .listen
                 )
                 .tag(SidebarItem.listen)
             }
 
-            if enableOnePlane {
+            if isVisible(enableOnePlane) {
                 SidebarItemCell(
                     label: "Plane",
                     icon: "square.stack.3d.down.right.fill",
-                    item: .plane,
-                    selection: appState.selectedSidebarItem
+                    item: .plane
                 )
                 .tag(SidebarItem.plane)
             }
 
-            if showHome {
+            if isVisible(showHome) {
                 SidebarItemCell(
                     label: "Home",
                     icon: "house.fill",
-                    item: .home,
-                    selection: appState.selectedSidebarItem
+                    item: .home
                 )
                 .tag(SidebarItem.home)
             }
 
-            if showNewMusic {
+            if isVisible(showNewMusic) {
                 SidebarItemCell(
                     label: "New Music",
                     icon: "sparkles",
                     item: .newMusic,
-                    selection: appState.selectedSidebarItem,
                     badgeCount: appState.unseenDiscoveryCount
                 )
                 .tag(SidebarItem.newMusic)
             }
 
-            if showRecentlyAdded {
+            if isVisible(showRecentlyAdded) {
                 SidebarItemCell(
                     label: "Recently Added",
                     icon: "clock.badge.checkmark",
-                    item: .recentlyAdded,
-                    selection: appState.selectedSidebarItem
+                    item: .recentlyAdded
                 )
                 .tag(SidebarItem.recentlyAdded)
             }
 
-            if showWaitingRoom {
+            if isVisible(showWaitingRoom) {
                 SidebarItemCell(
                     label: "Waiting Room",
                     icon: "tray.fill",
-                    item: .waitingRoom,
-                    selection: appState.selectedSidebarItem
+                    item: .waitingRoom
                 )
                 .tag(SidebarItem.waitingRoom)
             }
 
-            if showProjects {
+            if isVisible(showProjects) {
                 SidebarItemCell(
                     label: "Projects",
                     icon: "tray.full.fill",
-                    item: .projects,
-                    selection: appState.selectedSidebarItem
+                    item: .projects
                 )
                 .tag(SidebarItem.projects)
             }
 
-            if showUnclassified && appState.unclassifiedCount > 0 {
+            if isVisible(showUnclassified) && appState.unclassifiedCount > 0 {
                 SidebarItemCell(
                     label: "Unclassified",
                     icon: "rectangle.dashed",
                     item: .unclassified,
-                    selection: appState.selectedSidebarItem,
                     badgeCount: appState.unclassifiedCount
                 )
                 .tag(SidebarItem.unclassified)
             }
 
-            if enableFetcherSourceBrowser {
+            // Import Policies is normally reached from Settings. Goal 01's
+            // shell route must make every protected Resonance destination
+            // observable without changing normal navigation, so expose the
+            // existing production route only while the atlas gate is active.
+            if forcesAtlasVisibility {
                 SidebarItemCell(
-                    label: "Sources",
-                    icon: "tray.and.arrow.down.fill",
-                    item: .fetcherSources,
-                    selection: appState.selectedSidebarItem
+                    label: "Import Policies",
+                    icon: "slider.horizontal.3",
+                    item: .importPolicies
                 )
-                .tag(SidebarItem.fetcherSources)
+                .tag(SidebarItem.importPolicies)
             }
 
-            if showRadio {
+            if isVisible(showRadio) {
                 SidebarItemCell(
                     label: "Radio",
                     icon: "antenna.radiowaves.left.and.right",
-                    item: .radio,
-                    selection: appState.selectedSidebarItem
+                    item: .radio
                 )
                 .tag(SidebarItem.radio)
             }
@@ -285,38 +286,34 @@ struct SidebarView: View {
                     SidebarItemCell(
                         label: item.label,
                         icon: item.filledIcon,
-                        item: item,
-                        selection: appState.selectedSidebarItem
+                        item: item
                     )
                     .tag(item)
                 }
 
-                if showFavorites {
+                if isVisible(showFavorites) {
                     SidebarItemCell(
                         label: "Liked Songs",
                         icon: "heart.fill",
-                        item: .favorites,
-                        selection: appState.selectedSidebarItem
+                        item: .favorites
                     )
                     .tag(SidebarItem.favorites)
                 }
 
-                if showRecentlyPlayed {
+                if isVisible(showRecentlyPlayed) {
                     SidebarItemCell(
                         label: "Recently Played",
                         icon: "clock.fill",
-                        item: .recentlyPlayed,
-                        selection: appState.selectedSidebarItem
+                        item: .recentlyPlayed
                     )
                     .tag(SidebarItem.recentlyPlayed)
                 }
 
-                if showDownloads {
+                if isVisible(showDownloads) {
                     SidebarItemCell(
                         label: "Downloads",
                         icon: "arrow.down.circle.fill",
-                        item: .downloads,
-                        selection: appState.selectedSidebarItem
+                        item: .downloads
                     )
                     .tag(SidebarItem.downloads)
                 }
@@ -339,8 +336,7 @@ struct SidebarView: View {
                 SidebarItemCell(
                     label: "All Playlists",
                     icon: "music.note.list",
-                    item: .playlists,
-                    selection: appState.selectedSidebarItem
+                    item: .playlists
                 )
                 .tag(SidebarItem.playlists)
 
@@ -360,7 +356,7 @@ struct SidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .frame(height: 28)
+                .frame(height: 32) // uniform 32pt row pitch (Music 1.7 state 10 viewhierarchy)
 
                 Button {
                     appState.editSmartPlaylistTarget = nil
@@ -370,7 +366,7 @@ struct SidebarView: View {
                 }
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
-                .frame(height: 28)
+                .frame(height: 32)
             }
         } header: {
             SidebarHeaderCell(
@@ -396,7 +392,7 @@ struct SidebarSmartPlaylistCell: View {
             Label(smartPlaylist.name, systemImage: "wand.and.stars")
         }
         .buttonStyle(.plain)
-        .frame(height: 28)
+        .frame(height: 32) // native: rows 32pt @32 pitch (AX exact)
         .contextMenu {
             Button {
                 appState.editSmartPlaylistTarget = smartPlaylist
@@ -427,23 +423,24 @@ struct SidebarHeaderCell: View {
         Button(action: onToggle) {
             HStack(spacing: 4) {
                 Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
-                    .font(.system(size: 10, weight: .semibold))
+                    .font(.system(size: 9, weight: .semibold))
                     .foregroundStyle(.tertiary)
                     .frame(width: 12)
 
                 Text(title)
-                    .font(.subheadline)
-                    .fontWeight(.semibold)
+                    .font(.system(size: 11, weight: .semibold)) // native header ~11pt
                     .foregroundStyle(.secondary)
 
                 Spacer()
             }
-            .padding(.top, 8)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .accessibilityLabel("\(title) section, \(isCollapsed ? "collapsed" : "expanded")")
-        .accessibilityHint("Double tap to \(isCollapsed ? "expand" : "collapse")")
+        .frame(height: 19) // Music 1.7: section header rows measure 19pt (state 10 viewhierarchy)
+        .accessibilityLabel(title)
+        .accessibilityValue(isCollapsed ? "Collapsed" : "Expanded")
+        .accessibilityHint(isCollapsed ? "Expands the \(title) section" : "Collapses the \(title) section")
+        .accessibilityIdentifier("sidebar-section-\(title.lowercased())")
     }
 }
 
@@ -453,42 +450,39 @@ struct SidebarItemCell: View {
     let label: String
     let icon: String
     let item: SidebarItem
-    let selection: SidebarItem?
     var badgeCount: Int = 0
-
-    private var isSelected: Bool {
-        selection == item
-    }
 
     var body: some View {
         HStack(spacing: 8) {
             Image(systemName: icon)
                 .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(isSelected ? Color.accentColor : .secondary)
+                .foregroundStyle(.secondary)
                 .frame(width: 20)
 
             Text(label)
                 .font(.system(size: 13))
-                .foregroundStyle(isSelected ? .primary : .primary)
+                .lineLimit(1)
+                .truncationMode(.tail)
+
+            Spacer(minLength: 4)
 
             if badgeCount > 0 {
-                Spacer()
                 Text("\(badgeCount)")
-                    .font(.system(size: 10, weight: .semibold))
-                    .foregroundStyle(.white)
-                    .padding(.horizontal, 5)
+                    .font(.system(size: 11, weight: .medium).monospacedDigit())
+                    .foregroundStyle(.secondary)
+                    .padding(.horizontal, 6)
                     .padding(.vertical, 1)
-                    .background(Capsule().fill(.blue))
+                    .background(Capsule().fill(.quaternary))
             }
         }
-        .frame(height: 28)
-        .frame(maxWidth: .infinity, alignment: .leading)
         .padding(.horizontal, 8)
-        .background(
-            RoundedRectangle(cornerRadius: 6)
-                .fill(isSelected ? Color.accentColor.opacity(0.15) : Color.clear)
-        )
-        .contentShape(RoundedRectangle(cornerRadius: 6))
+        .frame(height: 32) // Music 1.7: every source-list row is 32pt tall at 32pt pitch (state 10 viewhierarchy)
+        .contentShape(Rectangle())
+        // Selection highlighting, keyboard focus, and inactive-window dimming are
+        // owned by List(selection:) + .sidebar style, matching the native
+        // NSOutlineView row-selection mechanism. Cells never paint their own
+        // selection background.
+        .accessibilityElement(children: .combine)
         .accessibilityIdentifier("sidebar-\(item.rawValue)")
     }
 }
@@ -514,7 +508,7 @@ struct SidebarPinCell: View {
 
                 Spacer()
             }
-            .frame(height: 28)
+            .frame(height: 32) // uniform 32pt row pitch (Music 1.7 state 10 viewhierarchy)
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
@@ -604,7 +598,7 @@ struct SidebarPlaylistCell: View {
 
                 Spacer()
             }
-            .frame(height: 28)
+            .frame(height: 32)
             .padding(.horizontal, 4)
             .background(
                 RoundedRectangle(cornerRadius: 6)
@@ -657,67 +651,25 @@ struct SidebarPlaylistCell: View {
 
 // MARK: - Sidebar Search Field
 
-struct SidebarSearchField: View {
+struct SidebarSearchNavigation: View {
     @Environment(AppState.self) private var appState
-    @FocusState private var isSearchFocused: Bool
 
     var body: some View {
-        @Bindable var state = appState
-
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass")
-                .foregroundStyle(.secondary)
-                .font(.system(size: 12))
-
-            TextField("Search", text: $state.searchQuery)
-                .textFieldStyle(.plain)
+        Button {
+            appState.selectedSidebarItem = .search
+            appState.shouldFocusSearch = true
+        } label: {
+            Label("Search", systemImage: "magnifyingglass")
                 .font(.system(size: 13))
-                .focused($isSearchFocused)
-                .onChange(of: state.searchQuery) { _, newValue in
-                    if !newValue.isEmpty && appState.selectedSidebarItem != .search {
-                        appState.selectedSidebarItem = .search
-                    }
-                }
-                .onSubmit {
-                    if appState.selectedSidebarItem != .search {
-                        appState.selectedSidebarItem = .search
-                    }
-                }
-                .onKeyPress(.escape) {
-                    if !appState.searchQuery.isEmpty {
-                        appState.searchQuery = ""
-                    }
-                    isSearchFocused = false
-                    return .handled
-                }
-
-            if !appState.searchQuery.isEmpty {
-                Button {
-                    appState.searchQuery = ""
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                        .font(.system(size: 12))
-                }
-                .buttonStyle(.plain)
-            }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .contentShape(Rectangle())
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 5)
-        .background(.quaternary.opacity(0.5))
-        .clipShape(RoundedRectangle(cornerRadius: 8))
-        .overlay {
-            if isSearchFocused {
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.accentColor.opacity(0.5), lineWidth: 1)
-            }
-        }
-        .onChange(of: appState.shouldFocusSearch) { _, shouldFocus in
-            if shouldFocus {
-                isSearchFocused = true
-                appState.shouldFocusSearch = false
-            }
-        }
+        .buttonStyle(.plain)
+        .background(appState.selectedSidebarItem == .search
+            ? Color.primary.opacity(0.08) : .clear,
+            in: RoundedRectangle(cornerRadius: 8))
         .accessibilityIdentifier("sidebar-search")
     }
 }
@@ -739,6 +691,16 @@ struct SidebarFooter: View {
             return .red
         case .disconnected, .offline:
             return .gray
+        }
+    }
+
+    private var statusText: String {
+        switch appState.connectionStatus {
+        case .connected: return "connected"
+        case .connecting: return "connecting"
+        case .error: return "error"
+        case .disconnected: return "disconnected"
+        case .offline: return "offline"
         }
     }
 
@@ -849,52 +811,14 @@ struct SidebarFooter: View {
                 isHovered = hovering
             }
         }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(appState.activeServer?.username ?? "Not Signed In"), \(appState.activeServer?.name ?? "No Server")")
+        .accessibilityValue("Connection \(statusText)")
+        .accessibilityHint("Opens Settings")
         .accessibilityIdentifier("sidebar-footer")
     }
 }
 
-// MARK: - Playlist Drop Delegate (Alternative approach for more control)
-
-struct PlaylistDropDelegate: DropDelegate {
-    let playlist: Playlist
-    let appState: AppState
-
-    func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [UTType.text])
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard let provider = info.itemProviders(for: [UTType.text]).first else {
-            return false
-        }
-
-        provider.loadItem(forTypeIdentifier: UTType.text.identifier, options: nil) { item, error in
-            guard let data = item as? Data,
-                  let songIds = String(data: data, encoding: .utf8)?
-                    .split(separator: ",")
-                    .map(String.init),
-                  !songIds.isEmpty else {
-                return
-            }
-
-            Task { @MainActor in
-                do {
-                    try await appState.networkActor.updatePlaylist(
-                        id: playlist.id,
-                        songIdsToAdd: songIds
-                    )
-                    // Refresh playlists
-                    let playlists = try await appState.networkActor.fetchPlaylists()
-                    appState.playlists = playlists
-                } catch {
-                    print("Failed to add songs to playlist: \(error)")
-                }
-            }
-        }
-
-        return true
-    }
-}
 
 // MARK: - Preview
 

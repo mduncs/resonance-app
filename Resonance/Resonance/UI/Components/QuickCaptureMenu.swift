@@ -10,6 +10,7 @@ struct QuickCaptureMenu<LabelContent: View>: View {
     @State private var isLiked = false
     @State private var isFavorite: Bool
     @State private var projects: [Project] = []
+    @State private var isPerformingAction = false
 
     init(song: Song, @ViewBuilder label: @escaping () -> LabelContent) {
         self.song = song
@@ -87,6 +88,7 @@ struct QuickCaptureMenu<LabelContent: View>: View {
             } label: {
                 Label("Add to Project", systemImage: "tray.and.arrow.down")
             }
+            .disabled(appState.activeServerId == nil)
 
             Button {
                 perform("more-like-this")
@@ -118,6 +120,7 @@ struct QuickCaptureMenu<LabelContent: View>: View {
         } label: {
             label()
         }
+        .disabled(isPerformingAction)
         .task(id: "\(appState.activeServerId ?? "none"):\(song.id)") {
             loadLocalState()
             loadProjects()
@@ -131,11 +134,46 @@ struct QuickCaptureMenu<LabelContent: View>: View {
     /// Dispatch a verb through the registry — the writes live there, so the menu
     /// only owns its optimistic display state (the label/disabled toggles above).
     private func perform(_ id: String) {
+        guard !isPerformingAction else { return }
         guard let verb = CurationVerbRegistry.verb(id: id) else { return }
         let context = CurationVerbContext(appState: appState, song: song, album: nil)
-        Task {
-            _ = await verb.perform(context)
+        isPerformingAction = true
+        Task { @MainActor in
+            defer { isPerformingAction = false }
+            let outcome = await verb.perform(context)
+            guard !outcome.isStale else { return }
+            if id == "favorite", !outcome.localChangeApplied {
+                loadLocalState()
+            }
+            if let message = outcome.message {
+                appState.showFeedback(
+                    message: message,
+                    detail: outcome.detail,
+                    style: outcome.style.appFeedbackStyle,
+                    systemImage: verb.systemImage
+                )
+                if id != "favorite" || outcome.localChangeApplied {
+                    NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
+                }
+            } else if Self.expectsFeedback(for: id) {
+                // The registry reserves nil outcomes for failures and actions
+                // that deliberately open a sheet. Restore optimistic labels
+                // when a write did not complete.
+                if ["admit", "reject", "like"].contains(id) {
+                    loadLocalState()
+                }
+                appState.showFeedback(
+                    message: "Couldn't complete \(verb.title.lowercased())",
+                    detail: outcome.detail ?? "Please try again.",
+                    style: .error,
+                    systemImage: "exclamationmark.triangle"
+                )
+            }
         }
+    }
+
+    private static func expectsFeedback(for verbID: String) -> Bool {
+        !["add-to-playlist", "more-like-this", "get-info", "delete"].contains(verbID)
     }
 
     private func loadProjects() {
@@ -144,13 +182,30 @@ struct QuickCaptureMenu<LabelContent: View>: View {
             return
         }
 
-        projects = (try? appState.databaseManager.loadProjects(serverId: serverId)) ?? []
+        do {
+            projects = try appState.databaseManager.loadProjects(serverId: serverId)
+        } catch {
+            projects = []
+            appState.showFeedback(
+                message: "Couldn't load projects",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "tray.full"
+            )
+        }
     }
 
     // The project picker keeps its per-project UI here, but its writes route
     // through the same `CurationVerbRegistry` helpers the deck's Project verb uses.
     private func addToProject(_ project: Project) {
-        guard let serverId = appState.activeServerId else { return }
+        guard let serverId = appState.activeServerId else {
+            appState.showFeedback(
+                message: "Connect to a server to manage projects",
+                style: .warning,
+                systemImage: "tray.full"
+            )
+            return
+        }
 
         do {
             try CurationVerbRegistry.addSongToProject(
@@ -159,13 +214,27 @@ struct QuickCaptureMenu<LabelContent: View>: View {
                 serverId: serverId,
                 database: appState.databaseManager
             )
+            appState.showFeedback(message: "Added to \(project.name)", style: .success, systemImage: "tray.full")
+            NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
         } catch {
-            print("Failed to add song to project: \(error)")
+            appState.showFeedback(
+                message: "Couldn't add to \(project.name)",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "exclamationmark.triangle"
+            )
         }
     }
 
     private func createProjectFromSong() {
-        guard let serverId = appState.activeServerId else { return }
+        guard let serverId = appState.activeServerId else {
+            appState.showFeedback(
+                message: "Connect to a server to manage projects",
+                style: .warning,
+                systemImage: "tray.full"
+            )
+            return
+        }
 
         do {
             let project = try CurationVerbRegistry.createListeningProject(
@@ -175,22 +244,40 @@ struct QuickCaptureMenu<LabelContent: View>: View {
             )
             projects.removeAll { $0.id == project.id }
             projects.insert(project, at: 0)
+            appState.showFeedback(message: "Created project \(project.name)", style: .success, systemImage: "tray.full")
+            NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
         } catch {
-            print("Failed to create project from song: \(error)")
+            appState.showFeedback(
+                message: "Couldn't create project",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "exclamationmark.triangle"
+            )
         }
     }
 
     private func loadLocalState() {
         isFavorite = song.starred != nil
+        isHidden = false
+        isLiked = false
 
         guard let serverId = appState.activeServerId else {
-            isHidden = false
-            isLiked = false
             return
         }
 
-        isHidden = (try? appState.databaseManager.isHidden(id: song.id, type: "song", serverId: serverId)) ?? false
-        isLiked = (try? appState.databaseManager.isLiked(id: song.id, type: "song", serverId: serverId)) ?? false
+        do {
+            let hidden = try appState.databaseManager.isHidden(id: song.id, type: "song", serverId: serverId)
+            let liked = try appState.databaseManager.isLiked(id: song.id, type: "song", serverId: serverId)
+            isHidden = hidden
+            isLiked = liked
+        } catch {
+            appState.showFeedback(
+                message: "Couldn't load song status",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "exclamationmark.triangle"
+            )
+        }
     }
 }
 

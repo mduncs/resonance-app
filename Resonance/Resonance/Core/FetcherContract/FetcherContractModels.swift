@@ -802,6 +802,12 @@ struct FetcherContractHealthRow: Codable, Identifiable, Hashable, Sendable {
 /// the authoritative writer; v2 resolves the exact Navidrome song identity.
 /// Every v2 addition is optional so the v1 export remains decodable.
 struct FetcherSourceAttribution: Codable, Identifiable, Hashable, Sendable {
+    struct ResolvedTrack: Codable, Hashable, Sendable {
+        let navidromeSongId: String
+        let localFileRelativePath: String?
+        let resolutionMethod: String?
+        enum CodingKeys: String, CodingKey { case navidromeSongId = "navidrome_song_id"; case localFileRelativePath = "local_file_relative_path"; case resolutionMethod = "resolution_method" }
+    }
     let attributionKey: String
     let localPath: String
     let sourceCollectionKey: String
@@ -818,6 +824,7 @@ struct FetcherSourceAttribution: Codable, Identifiable, Hashable, Sendable {
     let album: String?
     let durationMs: Int?
     let isrc: String?
+    let resolvedTracks: [ResolvedTrack]?
 
     var id: String { attributionKey }
 
@@ -838,6 +845,7 @@ struct FetcherSourceAttribution: Codable, Identifiable, Hashable, Sendable {
         album: String? = nil,
         durationMs: Int? = nil,
         isrc: String? = nil
+        , resolvedTracks: [ResolvedTrack]? = nil
     ) {
         self.attributionKey = attributionKey
         self.localPath = localPath
@@ -855,6 +863,7 @@ struct FetcherSourceAttribution: Codable, Identifiable, Hashable, Sendable {
         self.album = album
         self.durationMs = durationMs
         self.isrc = isrc
+        self.resolvedTracks = resolvedTracks
     }
 
     enum CodingKeys: String, CodingKey {
@@ -874,5 +883,33 @@ struct FetcherSourceAttribution: Codable, Identifiable, Hashable, Sendable {
         case album
         case durationMs = "duration_ms"
         case isrc
+        case resolvedTracks = "resolved_tracks"
+    }
+
+    init(from decoder: Decoder) throws {
+        let values = try decoder.container(keyedBy: CodingKeys.self)
+        attributionKey = try values.decode(String.self, forKey: .attributionKey)
+        localPath = try values.decode(String.self, forKey: .localPath)
+        sourceCollectionKey = try values.decode(String.self, forKey: .sourceCollectionKey)
+        sourceKind = try values.decode(String.self, forKey: .sourceKind)
+        sourceDisplayName = try values.decode(String.self, forKey: .sourceDisplayName)
+        downloadSource = try values.decodeIfPresent(String.self, forKey: .downloadSource)
+        queryContext = try values.decodeIfPresent(String.self, forKey: .queryContext)
+        acquiredAt = try values.decodeIfPresent(String.self, forKey: .acquiredAt)
+        contractVersion = try values.decodeIfPresent(Int.self, forKey: .contractVersion) ?? 1
+        navidromeSongId = try values.decodeIfPresent(String.self, forKey: .navidromeSongId)
+        resolutionMethod = try values.decodeIfPresent(String.self, forKey: .resolutionMethod)
+        title = try values.decodeIfPresent(String.self, forKey: .title)
+        artist = try values.decodeIfPresent(String.self, forKey: .artist)
+        album = try values.decodeIfPresent(String.self, forKey: .album)
+        durationMs = try values.decodeIfPresent(Int.self, forKey: .durationMs)
+        isrc = try values.decodeIfPresent(String.self, forKey: .isrc)
+        if let tracks = try? values.decode([ResolvedTrack].self, forKey: .resolvedTracks) {
+            resolvedTracks = tracks
+        } else if let serialized = try values.decodeIfPresent(String.self, forKey: .resolvedTracks) {
+            resolvedTracks = try JSONDecoder().decode([ResolvedTrack].self, from: Data(serialized.utf8))
+        } else {
+            resolvedTracks = nil
+        }
     }
 }

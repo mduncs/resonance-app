@@ -1,5 +1,6 @@
 import Foundation
 import XCTest
+import GRDB
 @testable import Resonance
 
 /// Covers the OP-3 verb registry: the pinned deck shape, and the extracted
@@ -169,6 +170,76 @@ final class CurationVerbRegistryTests: XCTestCase {
         }
     }
 
+    func testFavoriteLocalWriteFailureDoesNotPublishSuccessOrMutateInMemorySong() async throws {
+        try await withTemporaryUserHomeAsync {
+            let appState = AppState()
+            let server = Server(
+                id: UUID(),
+                name: "Scratch Server",
+                url: URL(string: "https://scratch.invalid")!,
+                username: "test"
+            )
+            let song = makeSong(id: "song-favorite-write-failure")
+            appState.activeServer = server
+            appState.nowPlaying = song
+
+            try await appState.databaseManager.dbPool.write { db in
+                try db.execute(sql: """
+                    CREATE TRIGGER fail_favorite_insert
+                    BEFORE INSERT ON starred_items
+                    WHEN NEW.item_type = 'song'
+                    BEGIN
+                        SELECT RAISE(ABORT, 'injected favorite write failure');
+                    END
+                    """)
+            }
+
+            let context = CurationVerbContext(appState: appState, song: song, album: nil)
+            let favorite = try XCTUnwrap(CurationVerbRegistry.verb(id: "favorite"))
+            let outcome = await favorite.perform(context)
+
+            XCTAssertNil(outcome.message, "A rejected local write must not report a favorite success")
+            XCTAssertEqual(outcome.style, .error)
+            XCTAssertNotNil(outcome.detail)
+            XCTAssertFalse(outcome.localChangeApplied)
+            XCTAssertFalse(outcome.isStale)
+            XCTAssertNil(appState.nowPlaying?.starred, "A failed DB write must not fabricate in-memory success")
+            XCTAssertTrue(try appState.databaseManager.loadStarredIds(
+                type: "song",
+                serverId: server.id.uuidString
+            ).isEmpty)
+        }
+    }
+
+    func testFavoriteWithoutConnectionReportsPersistedLocalSuccess() async throws {
+        try await withTemporaryUserHomeAsync {
+            let appState = AppState()
+            let server = Server(
+                id: UUID(),
+                name: "Scratch Server",
+                url: URL(string: "https://scratch.invalid")!,
+                username: "test"
+            )
+            let song = makeSong(id: "song-favorite-local-first")
+            appState.activeServer = server
+            appState.nowPlaying = song
+
+            let context = CurationVerbContext(appState: appState, song: song, album: nil)
+            let favorite = try XCTUnwrap(CurationVerbRegistry.verb(id: "favorite"))
+            let outcome = await favorite.perform(context)
+
+            XCTAssertEqual(outcome.message, "Favorited locally")
+            XCTAssertEqual(outcome.style, .info)
+            XCTAssertTrue(outcome.localChangeApplied)
+            XCTAssertFalse(outcome.isStale)
+            XCTAssertNotNil(appState.nowPlaying?.starred)
+            XCTAssertEqual(
+                try appState.databaseManager.loadStarredIds(type: "song", serverId: server.id.uuidString).map(\.itemId),
+                [song.id]
+            )
+        }
+    }
+
     func testMarkCaptureSourceStagesLaterAndInteresting() throws {
         try withTemporaryUserHome {
             let database = try DatabaseManager()
@@ -258,5 +329,26 @@ final class CurationVerbRegistryTests: XCTestCase {
         }
 
         return try body()
+    }
+
+    private func withTemporaryUserHomeAsync<T>(_ body: () async throws -> T) async throws -> T {
+        let fileManager = FileManager.default
+        let homeURL = fileManager.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try fileManager.createDirectory(at: homeURL, withIntermediateDirectories: true)
+
+        let previousHome = getenv("CFFIXED_USER_HOME").map { String(cString: $0) }
+        setenv("CFFIXED_USER_HOME", homeURL.path, 1)
+
+        defer {
+            if let previousHome {
+                setenv("CFFIXED_USER_HOME", previousHome, 1)
+            } else {
+                unsetenv("CFFIXED_USER_HOME")
+            }
+            try? fileManager.removeItem(at: homeURL)
+        }
+
+        return try await body()
     }
 }

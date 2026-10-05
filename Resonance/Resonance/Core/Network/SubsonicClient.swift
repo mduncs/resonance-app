@@ -31,7 +31,8 @@ enum SubsonicEndpoint {
     case getPlaylists(username: String?)
     case getPlaylist(id: String)
     case createPlaylist(name: String, songIds: [String])
-    case updatePlaylist(id: String, name: String?, comment: String?, songIdsToAdd: [String], songIndexesToRemove: [Int])
+    case replacePlaylistSongs(id: String, songIds: [String])
+    case updatePlaylist(id: String, name: String?, comment: String?, isPublic: Bool?, songIdsToAdd: [String], songIndexesToRemove: [Int])
     case deletePlaylist(id: String)
 
     // Media Retrieval
@@ -83,7 +84,7 @@ enum SubsonicEndpoint {
         case .search3: return "search3"
         case .getPlaylists: return "getPlaylists"
         case .getPlaylist: return "getPlaylist"
-        case .createPlaylist: return "createPlaylist"
+        case .createPlaylist, .replacePlaylistSongs: return "createPlaylist"
         case .updatePlaylist: return "updatePlaylist"
         case .deletePlaylist: return "deletePlaylist"
         case .stream: return "stream"
@@ -168,10 +169,15 @@ enum SubsonicEndpoint {
             items.append(contentsOf: songIds.map { URLQueryItem(name: "songId", value: $0) })
             return items
 
-        case .updatePlaylist(let id, let name, let comment, let songIdsToAdd, let songIndexesToRemove):
+        case .replacePlaylistSongs(let id, let songIds):
+            return [URLQueryItem(name: "playlistId", value: id)]
+                + songIds.map { URLQueryItem(name: "songId", value: $0) }
+
+        case .updatePlaylist(let id, let name, let comment, let isPublic, let songIdsToAdd, let songIndexesToRemove):
             var items = [URLQueryItem(name: "playlistId", value: id)]
             if let name { items.append(URLQueryItem(name: "name", value: name)) }
             if let comment { items.append(URLQueryItem(name: "comment", value: comment)) }
+            if let isPublic { items.append(URLQueryItem(name: "public", value: isPublic ? "true" : "false")) }
             items.append(contentsOf: songIdsToAdd.map { URLQueryItem(name: "songIdToAdd", value: $0) })
             items.append(contentsOf: songIndexesToRemove.map { URLQueryItem(name: "songIndexToRemove", value: String($0)) })
             return items

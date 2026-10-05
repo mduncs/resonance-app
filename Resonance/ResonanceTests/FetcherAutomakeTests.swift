@@ -197,7 +197,7 @@ final class FetcherAutomakeTests: XCTestCase {
             sourceCollectionKey: collectionKey,
             sourceKind: "apple_playlist",
             sourceDisplayName: "Display",
-            downloadSource: "gamdl",
+            downloadSource: "fetcher",
             queryContext: nil,
             acquiredAt: acquiredAt,
             contractVersion: 2,

@@ -93,7 +93,7 @@ struct SongRow: View {
         .contentShape(Rectangle())
         .accessibilityElement(children: .combine)
         .accessibilityLabel(songAccessibilityLabel)
-        .accessibilityHint("Double tap to play")
+        .accessibilityHint("Plays the song")
         .accessibilityAddTraits(isPlaying ? [.isButton, .isSelected] : .isButton)
         .task(id: song.id) {
             await checkDownloadStatus()
@@ -148,7 +148,7 @@ struct SongRowCompact: View {
         .padding(.vertical, 2)
         .accessibilityElement(children: .combine)
         .accessibilityLabel(songAccessibilityLabel)
-        .accessibilityHint("Double tap to play")
+        .accessibilityHint("Plays the song")
         .accessibilityAddTraits(isPlaying ? [.isButton, .isSelected] : .isButton)
     }
 

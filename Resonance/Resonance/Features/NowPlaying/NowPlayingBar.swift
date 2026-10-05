@@ -1,92 +1,340 @@
 import SwiftUI
+import AppKit
 
 struct NowPlayingBar: View {
     @Environment(AppState.self) private var appState
-    @State private var isProgressHovered = false
+    @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @StateObject private var routeAvailability = AirPlayRouteAvailability()
+    @State private var isVolumeExpanded = false
+    @State private var isScrubberHovered = false
+    @State private var isScrubberDragging = false
+    @State private var scrubberDragProgress: CGFloat?
+    @State private var isPointerInsideBar = false
+    @State private var lastPointerLocation: CGPoint?
+    @State private var seekTask: Task<Void, Never>?
+    @State private var observedRepeatMode: RepeatMode = .off
 
-    private struct LayoutMetrics {
-        let controlsWidth: CGFloat
-        let utilitiesWidth: CGFloat
-        let horizontalPadding: CGFloat
-        let sectionSpacing: CGFloat
-        let controlSpacing: CGFloat
-        let volumeSliderWidth: CGFloat
-        let albumArtSize: CGFloat
+    /// Music 1.7 exposes a 700×54 NSGlassEffectView. Its controls live in a
+    /// separate 682×49 inner coordinate system, translated by approximately
+    /// (+9,+9) inside the host. Keep those coordinate systems explicit: the
+    /// host is not the old AX capsule.
+    private enum NativeMetrics {
+        static let hostWidth: CGFloat = 700
+        static let hostHeight: CGFloat = 54
+        static let innerWidth: CGFloat = 682
+        static let innerHeight: CGFloat = 49
+        static let innerOffsetX: CGFloat = 9
+        static let innerOffsetY: CGFloat = 9
+        static let albumArtSize: CGFloat = 34
+        static let centerWidth: CGFloat = 406
+        static let centerWidthWithRoutePicker: CGFloat = 369
+        static let scrubberRestHeight: CGFloat = 18
+        static let scrubberExpandedHeight: CGFloat = 32
+        static let scrubberRestTrackHeight: CGFloat = 2
+        static let scrubberExpandedTrackHeight: CGFloat = 8
     }
 
     var body: some View {
-        GeometryReader { geometry in
-            let metrics = layoutMetrics(for: geometry.size.width)
+        ZStack(alignment: .topLeading) {
+            Color.clear
+                .frame(width: NativeMetrics.hostWidth, height: NativeMetrics.hostHeight)
 
-            ZStack(alignment: .bottom) {
-                HStack(spacing: 0) {
-                    playbackControls(metrics: metrics)
-                        .frame(width: metrics.controlsWidth)
-
-                    Spacer()
-                        .frame(width: metrics.sectionSpacing)
-
-                    centerSection(metrics: metrics)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-
-                    Spacer()
-                        .frame(width: metrics.sectionSpacing)
-
-                    rightControls(metrics: metrics)
-                        .frame(width: metrics.utilitiesWidth)
-                }
-                .padding(.horizontal, metrics.horizontalPadding)
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            innerSurface
+            scrubberRow
+        }
+        .frame(width: NativeMetrics.hostWidth, height: NativeMetrics.hostHeight, alignment: .topLeading)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: isScrubberExpanded)
+        .animation(reduceMotion ? nil : .smooth(duration: 0.24), value: isVolumeExpanded)
+        .modifier(GlassEffectModifier(shape: .capsule))
+        .accessibilityElement(children: .contain)
+        // Track in the stable footer coordinate space, not the resizing rail:
+        // entering the thin strip reveals time; the revealed rail remains
+        // hovered as the pointer moves upward into it. No playback write here.
+        .onContinuousHover { phase in
+            switch phase {
+            case .active(let location):
+                isPointerInsideBar = true
+                lastPointerLocation = location
+                updateScrubberHover(at: location)
+            case .ended:
+                isPointerInsideBar = false
+                lastPointerLocation = nil
+                isScrubberHovered = false
             }
         }
-        .frame(height: 54)
-        .modifier(GlassEffectModifier(shape: .capsule))
-        .accessibilityIdentifier("NowPlayingBar")
-        .accessibilityLabel("Now Playing Bar")
+        .onChange(of: appState.nowPlaying?.id) { _, _ in
+            resetScrubberInteraction()
+        }
+        .onChange(of: appState.activeServerId) { _, _ in
+            resetScrubberInteraction()
+        }
+        .onChange(of: isVolumeExpanded) { _, expanded in
+            if expanded {
+                isScrubberHovered = false
+            } else if isPointerInsideBar, let lastPointerLocation {
+                updateScrubberHover(at: lastPointerLocation)
+            }
+        }
+        .onChange(of: isScrubberAvailable) { _, available in
+            if !available {
+                resetScrubberInteraction()
+            }
+        }
+        .onDisappear {
+            resetScrubberInteraction()
+            isPointerInsideBar = false
+            lastPointerLocation = nil
+        }
+        .onReceive(appState.playbackManager.$repeatMode) { mode in
+            observedRepeatMode = mode
+        }
     }
 
-    // MARK: - Center Section (album art, song info, progress bar directly underneath)
+    /// The old AX fixture's 682×49 interaction surface. The native hierarchy
+    /// places it about (+9,+9) inside the 700×54 glass host; child frames stay
+    /// in that inner coordinate system.
+    private var innerSurface: some View {
+        ZStack(alignment: .topLeading) {
+            playbackControls()
+            centerSection()
+            rightControls()
+        }
+        .frame(width: NativeMetrics.innerWidth, height: NativeMetrics.innerHeight, alignment: .topLeading)
+        .offset(x: NativeMetrics.innerOffsetX, y: NativeMetrics.innerOffsetY)
+    }
 
-    private func centerSection(metrics: LayoutMetrics) -> some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Album art + song info with optional blur on progress hover
-            ZStack(alignment: .leading) {
-                nowPlayingInfo(albumArtSize: metrics.albumArtSize)
-                    .blur(radius: isProgressHovered ? 8 : 0)
-                    .opacity(isProgressHovered ? 0.6 : 1)
+    private var showsRoutePicker: Bool {
+        if let fixture = DeterministicCaptureFixture.configuration {
+            return fixture.multipleRoutesDetected
+        }
+        return routeAvailability.multipleRoutesDetected
+    }
 
-                // Time display overlay - appears on hover
-                if appState.nowPlaying != nil && appState.currentDuration > 0 && appState.playbackManager.currentSourceSupportsSeeking && isProgressHovered {
-                    HStack {
-                        Text(formatTime(appState.currentTime))
-                            .font(.system(size: 10, weight: .medium))
-                            .monospacedDigit()
-                            .foregroundStyle(.primary)
+    private var centerWidth: CGFloat {
+        showsRoutePicker ? NativeMetrics.centerWidthWithRoutePicker : NativeMetrics.centerWidth
+    }
 
-                        Spacer()
+    private var metadataTextWidth: CGFloat {
+        // Native metadata: artwork 34 + gap 8, text, gap 8 + More 36.
+        centerWidth - 86
+    }
 
-                        Text("-\(formatTime(appState.currentDuration - appState.currentTime))")
-                            .font(.system(size: 10, weight: .medium))
-                            .monospacedDigit()
-                            .foregroundStyle(.primary)
-                    }
-                    .padding(.horizontal, 12)
-                    .transition(.opacity.combined(with: .scale(scale: 0.95)))
+    // Footer ink is monochrome, independent of the user's Finder/accent color.
+    // Explicit enabled-mode colors remain on shuffle/repeat/inspector controls.
+    private var controlInk: Color { colorScheme == .dark ? .white : .black }
+
+    private var scrubberHitWidth: CGFloat {
+        centerWidth - 4
+    }
+
+    private var scrubberSurfaceHeight: CGFloat {
+        isScrubberExpanded ? NativeMetrics.scrubberExpandedHeight : NativeMetrics.scrubberRestHeight
+    }
+
+    private var isScrubberExpanded: Bool {
+        isScrubberAvailable && (isScrubberHovered || isScrubberDragging)
+    }
+
+    private var rightControlsOffsetX: CGFloat {
+        showsRoutePicker ? 535 : 572
+    }
+
+    private var rightControlsWidth: CGFloat {
+        showsRoutePicker ? 148 : 111
+    }
+
+    // MARK: - Center Section (inner artwork 157,1 → host 166,10)
+
+    private func centerSection() -> some View {
+        ZStack(alignment: .topLeading) {
+            nowPlayingInfo(albumArtSize: NativeMetrics.albumArtSize)
+                // Music's hover reference retains a faint, defocused trace of
+                // the cover/title above the timeline. Do not remove it entirely.
+                // These are screenshot-guided values, not captured filter inputs.
+                .blur(radius: isScrubberExpanded ? 3 : 0)
+                .opacity(isScrubberExpanded ? 0.55 : 1)
+                .mask {
+                    LinearGradient(stops: [
+                        .init(color: .black, location: 0),
+                        .init(color: .black, location: 0.25),
+                        .init(color: isScrubberExpanded ? .clear : .black, location: 1)
+                    ], startPoint: .top, endPoint: .bottom)
                 }
-            }
-            .modifier(ProgressHoverGlassModifier(isHovered: isProgressHovered))
-            .animation(.easeInOut(duration: 0.15), value: isProgressHovered)
-
-            // Progress bar directly underneath album info
-            if appState.nowPlaying != nil && appState.currentDuration > 0 && appState.playbackManager.currentSourceSupportsSeeking {
-                progressBar
-                    .frame(height: isProgressHovered ? 4 : 2)
-                    .padding(.horizontal, 8)
-                    .padding(.top, 4)
-                    .animation(.easeInOut(duration: 0.15), value: isProgressHovered)
+            if !isVolumeExpanded {
+                moreControl
+                    .opacity(isScrubberExpanded ? 0 : 1)
+                    .offset(x: centerWidth - 36, y: -1)
             }
         }
-        .frame(maxHeight: .infinity)
+        .allowsHitTesting(!isScrubberExpanded)
+        .accessibilityHidden(isScrubberExpanded)
+        .frame(width: centerWidth, height: 34, alignment: .topLeading)
+        .offset(x: 157, y: 1)
+    }
+
+    // MARK: - Scrubber (host-local frame 168,40,402,18)
+
+    private var scrubberRow: some View {
+        GeometryReader { geometry in
+            let trackWidth = geometry.size.width + 4
+            let trackHeight = isScrubberExpanded
+                ? NativeMetrics.scrubberExpandedTrackHeight
+                : NativeMetrics.scrubberRestTrackHeight
+
+            ZStack(alignment: .topLeading) {
+                HStack {
+                        Text(formatTime(scrubberTime))
+                        Spacer()
+                        Text("−\(formatTime(max(0, appState.currentDuration - scrubberTime)))")
+                    }
+                    // User's Sep 10 hover reference: timer ink matches the
+                    // 13-point footer text, rather than the former tiny labels.
+                    .font(.system(size: 13, weight: .semibold))
+                    .monospacedDigit()
+                    .foregroundStyle(controlInk)
+                    .frame(width: trackWidth, alignment: .leading)
+                    .offset(x: -2, y: -2)
+                    .opacity(isScrubberExpanded ? 1 : 0)
+
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(controlInk.opacity(isScrubberExpanded ? 0.28 : 0.16))
+                        .frame(width: trackWidth, height: trackHeight)
+
+                    Capsule()
+                        .fill(controlInk.opacity(isScrubberExpanded ? 0.78 : 0.52))
+                        .frame(
+                            width: progressWidth(in: trackWidth),
+                            height: trackHeight
+                        )
+                }
+                .frame(width: trackWidth, height: NativeMetrics.scrubberRestHeight)
+                .frame(
+                    width: trackWidth,
+                    height: scrubberSurfaceHeight,
+                    alignment: .center
+                )
+                // Native hover/drag track is host y37…45 inside the y21…53
+                // interaction surface, not vertically centered in that surface.
+                .offset(x: -2, y: isScrubberExpanded ? 4 : 0)
+            }
+            .frame(
+                width: geometry.size.width,
+                height: scrubberSurfaceHeight,
+                alignment: .topLeading
+            )
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { value in
+                        guard isScrubberAvailable, geometry.size.width > 0 else { return }
+                        if !isScrubberDragging {
+                            seekTask?.cancel()
+                            seekTask = nil
+                        }
+                        isScrubberDragging = true
+                        scrubberDragProgress = max(0, min(1, value.location.x / geometry.size.width))
+                    }
+                    .onEnded { value in
+                        guard isScrubberAvailable, geometry.size.width > 0 else {
+                            resetScrubberInteraction()
+                            return
+                        }
+                        let progress = max(0, min(1, value.location.x / geometry.size.width))
+                        isScrubberDragging = false
+                        commitSeek(to: progress * appState.currentDuration)
+                    }
+            )
+        }
+        .frame(width: scrubberHitWidth, height: scrubberSurfaceHeight)
+        .offset(x: 168, y: isScrubberExpanded ? 21 : 40)
+        .opacity(isScrubberAvailable ? 1 : 0)
+        .allowsHitTesting(isScrubberAvailable)
+        .accessibilityElement(children: .ignore)
+        .accessibilityIdentifier("FooterScrubber")
+        .accessibilityLabel("Playback position")
+        .accessibilityValue("\(formatTime(scrubberTime)) of \(formatTime(appState.currentDuration))")
+        .accessibilityHidden(!isScrubberAvailable)
+        .accessibilityAdjustableAction { direction in
+            adjustScrubber(direction)
+        }
+    }
+
+    private var scrubberTime: TimeInterval {
+        guard let dragProgress = scrubberDragProgress, appState.currentDuration > 0 else {
+            return appState.currentTime
+        }
+        return dragProgress * appState.currentDuration
+    }
+
+    private var isScrubberAvailable: Bool {
+        appState.nowPlaying != nil
+            && appState.currentDuration.isFinite
+            && appState.currentDuration > 0
+            && appState.playbackManager.currentSourceSupportsSeeking
+    }
+
+    private func commitSeek(to time: TimeInterval) {
+        guard isScrubberAvailable, time.isFinite else {
+            resetScrubberInteraction()
+            return
+        }
+
+        seekTask?.cancel()
+        let duration = appState.currentDuration
+        guard duration.isFinite, duration > 0,
+              let songID = appState.nowPlaying?.id else {
+            resetScrubberInteraction()
+            return
+        }
+        let target = max(0, min(duration, time))
+        let serverID = appState.activeServerId
+        scrubberDragProgress = CGFloat(target / duration)
+
+        seekTask = Task { @MainActor in
+            guard !Task.isCancelled,
+                  appState.nowPlaying?.id == songID,
+                  appState.activeServerId == serverID,
+                  isScrubberAvailable else {
+                return
+            }
+            await appState.playbackManager.seek(to: target)
+            guard !Task.isCancelled,
+                  appState.nowPlaying?.id == songID,
+                  appState.activeServerId == serverID else {
+                return
+            }
+            scrubberDragProgress = nil
+            seekTask = nil
+        }
+    }
+
+    private func adjustScrubber(_ direction: AccessibilityAdjustmentDirection) {
+        guard isScrubberAvailable else { return }
+        let step = max(1, appState.currentDuration * 0.05)
+        switch direction {
+        case .increment:
+            commitSeek(to: scrubberTime + step)
+        case .decrement:
+            commitSeek(to: scrubberTime - step)
+        @unknown default:
+            return
+        }
+    }
+
+    private func resetScrubberInteraction() {
+        seekTask?.cancel()
+        seekTask = nil
+        isScrubberHovered = false
+        isScrubberDragging = false
+        scrubberDragProgress = nil
+    }
+
+    private func updateScrubberHover(at location: CGPoint) {
+        let top: CGFloat = isScrubberExpanded ? 21 : 40
+        let region = CGRect(x: 166, y: top, width: centerWidth, height: 54 - top)
+        isScrubberHovered = !isVolumeExpanded && isScrubberAvailable && region.contains(location)
     }
 
     // MARK: - Glass Effect Modifiers
@@ -100,86 +348,67 @@ struct NowPlayingBar: View {
 
         func body(content: Content) -> some View {
             if #available(macOS 26.0, *) {
-                content.glassEffect(.regular, in: shape)
+                content
+                    .glassEffect(.regular.interactive(), in: shape)
             } else {
                 content
                     .background { shape.fill(.ultraThinMaterial) }
                     .clipShape(shape)
-                    .shadow(color: .black.opacity(0.15), radius: 8, x: 0, y: 4)
             }
-        }
-    }
-
-    private struct ProgressHoverGlassModifier: ViewModifier {
-        let isHovered: Bool
-
-        func body(content: Content) -> some View {
-            // Always apply padding to prevent layout shift on hover toggle
-            content
-                .padding(.vertical, 4)
-                .padding(.horizontal, 6)
-                .background {
-                    if isHovered {
-                        RoundedRectangle(cornerRadius: 8).fill(.ultraThinMaterial)
-                    }
-                }
-        }
-    }
-
-    // MARK: - Progress Bar
-
-    private var progressBar: some View {
-        GeometryReader { geometry in
-            ZStack(alignment: .leading) {
-                // Track
-                Capsule()
-                    .fill(Color.white.opacity(isProgressHovered ? 0.3 : 0.15))
-
-                // Progress
-                Capsule()
-                    .fill(Color.white.opacity(isProgressHovered ? 0.8 : 0.5))
-                    .frame(width: progressWidth(in: geometry.size.width))
-            }
-            .contentShape(Rectangle().size(width: geometry.size.width, height: 24))
-            .onHover { isProgressHovered = $0 }
-            .gesture(
-                DragGesture(minimumDistance: 0)
-                    .onEnded { value in
-                        let progress = max(0, min(1, value.location.x / geometry.size.width))
-                        Task {
-                            await appState.playbackManager.seek(to: progress * appState.currentDuration)
-                        }
-                    }
-            )
         }
     }
 
     private func progressWidth(in totalWidth: CGFloat) -> CGFloat {
-        guard appState.currentDuration > 0 else { return 0 }
-        return totalWidth * CGFloat(appState.currentTime / appState.currentDuration)
+        guard appState.currentDuration.isFinite, appState.currentDuration > 0 else { return 0 }
+        let currentProgress = appState.currentTime.isFinite
+            ? CGFloat(appState.currentTime / appState.currentDuration)
+            : 0
+        let rawRatio = scrubberDragProgress ?? currentProgress
+        let ratio = rawRatio.isFinite ? rawRatio : 0
+        return totalWidth * max(0, min(1, ratio))
     }
 
-    // MARK: - Playback Controls (Apple Music sizes, tighter spacing)
+    // MARK: - Playback Controls (inner frames translated +9,+9 into host)
 
-    private func playbackControls(metrics: LayoutMetrics) -> some View {
-        HStack(spacing: metrics.controlSpacing) {
+    private func playbackControls() -> some View {
+        ZStack(alignment: .topLeading) {
+            // Inner coordinates: shuffle (0,4,28,28), previous
+            // (28,4,28,28), play (56,0,36,36), next (92,4,28,28),
+            // repeat (120,4,28,28). The enclosing inner surface supplies
+            // the host-local (+9,+9) translation.
             Button {
                 appState.queueManager.toggleShuffle()
             } label: {
                 Image(systemName: "shuffle")
                     .font(.system(size: 11, weight: .medium))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(NativeTransportButtonStyle())
+            .frame(width: 28, height: 28)
+            .offset(x: 0, y: 4)
             .foregroundStyle(appState.queueManager.isShuffleEnabled ? Color.accentColor : .primary)
+            .accessibilityLabel(appState.queueManager.isShuffleEnabled ? "Shuffle on" : "Shuffle off")
+            .accessibilityHint("Double tap to toggle shuffle")
+            .accessibilityIdentifier("FooterShuffle")
+            .accessibilityAddTraits(appState.queueManager.isShuffleEnabled ? [.isButton, .isSelected] : .isButton)
 
             Button {
                 Task { await appState.playbackManager.previous() }
             } label: {
                 Image(systemName: "backward.fill")
-                    .font(.system(size: 13))
+                    .font(.system(size: 14.5))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(NativeTransportButtonStyle())
+            .frame(width: 28, height: 28)
+            .offset(x: 28, y: 4)
             .opacity(appState.playbackManager.canGoPrevious ? 1.0 : 0.3)
+            .disabled(!appState.playbackManager.canGoPrevious)
+            .accessibilityLabel("Previous track")
+            .accessibilityHint(appState.playbackManager.canGoPrevious ? "Double tap to play previous track" : "No previous track available")
+            .accessibilityIdentifier("FooterPrevious")
 
             Button {
                 Task {
@@ -191,188 +420,553 @@ struct NowPlayingBar: View {
                 }
             } label: {
                 Image(systemName: appState.playbackState == .playing ? "pause.fill" : "play.fill")
-                    .font(.system(size: 22))
+                    .font(.system(size: 26.5))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(NativePlayPauseButtonStyle())
+            .frame(width: 36, height: 36)
+            .offset(x: 56, y: 0)
             .keyboardShortcut(.space, modifiers: [])
+            .accessibilityLabel(appState.playbackState == .playing ? "Pause" : "Play")
+            .accessibilityHint(appState.playbackState == .playing ? "Double tap to pause" : "Double tap to play")
+            .accessibilityIdentifier("FooterPlayPause")
 
             Button {
                 Task { await appState.playbackManager.next() }
             } label: {
                 Image(systemName: "forward.fill")
-                    .font(.system(size: 13))
+                    .font(.system(size: 14.5))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
+            .buttonStyle(NativeTransportButtonStyle())
+            .frame(width: 28, height: 28)
+            .offset(x: 92, y: 4)
             .opacity(appState.playbackManager.canGoNext ? 1.0 : 0.3)
+            .disabled(!appState.playbackManager.canGoNext)
+            .accessibilityLabel("Next track")
+            .accessibilityHint(appState.playbackManager.canGoNext ? "Double tap to play next track" : "No next track available")
+            .accessibilityIdentifier("FooterNext")
 
             Button {
                 appState.playbackManager.cycleRepeatMode()
             } label: {
                 Image(systemName: repeatIcon)
                     .font(.system(size: 11, weight: .medium))
+                    .frame(width: 28, height: 28)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(appState.playbackManager.repeatMode != .off ? Color.accentColor : .primary)
+            .buttonStyle(NativeTransportButtonStyle())
+            .frame(width: 28, height: 28)
+            .offset(x: 120, y: 4)
+            .foregroundStyle(observedRepeatMode != .off ? Color.accentColor : .primary)
+            .accessibilityLabel(repeatAccessibilityLabel)
+            .accessibilityHint("Double tap to change repeat mode")
+            .accessibilityIdentifier("FooterRepeat")
+            .accessibilityAddTraits(observedRepeatMode != .off ? [.isButton, .isSelected] : .isButton)
+        }
+        .frame(width: 157, height: NativeMetrics.innerHeight, alignment: .topLeading)
+        .foregroundStyle(controlInk)
+        .tint(controlInk)
+    }
+
+    // MARK: - Hover/pressed (standard highlight, native has no custom mouse handlers)
+
+    private struct NativeTransportButtonStyle: ButtonStyle {
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+        func makeBody(configuration: Configuration) -> some View {
+            configuration.label
+                .scaleEffect(configuration.isPressed ? 0.9 : 1)
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: configuration.isPressed)
         }
     }
 
-    // MARK: - Now Playing Info (35px art, bold title, Artist - Album below)
+    private struct NativePlayPauseButtonStyle: ButtonStyle {
+        func makeBody(configuration: Configuration) -> some View {
+            NativePlayPauseButtonFace(isPressed: configuration.isPressed) {
+                configuration.label
+            }
+        }
+    }
+
+    /// Native 25-footer-play-pressed-light: the 36-point glyph parent shrinks
+    /// to 32.4 points, independently of the white, half-opacity press backing
+    /// expanding to 39.6 points. Only this control's pressed state is evidenced.
+    private struct NativePlayPauseButtonFace<Content: View>: View {
+        let isPressed: Bool
+        @Environment(\.accessibilityReduceMotion) private var reduceMotion
+        @ViewBuilder let content: Content
+
+        var body: some View {
+            content
+                .scaleEffect(isPressed ? 0.9 : 1)
+                .background {
+                    if isPressed {
+                        Circle()
+                            .fill(Color.white.opacity(0.5))
+                            .frame(width: 36, height: 36)
+                            .scaleEffect(1.1)
+                            .allowsHitTesting(false)
+                            .accessibilityHidden(true)
+                    }
+                }
+                .animation(reduceMotion ? nil : .easeOut(duration: 0.1), value: isPressed)
+        }
+    }
+
+    // MARK: - Now Playing Info (host-local artwork 166,10,34,34)
 
     @ViewBuilder
     private func nowPlayingInfo(albumArtSize: CGFloat) -> some View {
         if let song = appState.nowPlaying {
-            HStack(spacing: 10) {
-                // Album art - click for menu, right-click same menu
+            HStack(spacing: 8) {
                 AlbumArtMenuButton(song: song, size: albumArtSize)
+                    .frame(width: albumArtSize, height: albumArtSize)
 
-                // Song info - title bold, "Artist - Album" below
-                VStack(alignment: .leading, spacing: 2) {
-                    MarqueeText(text: song.title, font: .system(size: 12, weight: .bold))
-                        .onTapGesture { navigateToAlbumWithSong(albumId: song.albumId, songId: song.id) }
+                VStack(alignment: .leading, spacing: 0) {
+                    Button {
+                        navigateToAlbumWithSong(albumId: song.albumId, songId: song.id)
+                    } label: {
+                        MarqueeText(text: song.title, font: .system(size: 13, weight: .semibold))
+                            .frame(width: metadataTextWidth, height: 16, alignment: .leading)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(song.albumId.isEmpty)
+                    .accessibilityLabel("Album: \(song.album)")
+                    .accessibilityHint("Show the album containing \(song.title)")
+                    .help("Go to Album")
 
-                    MarqueeText(
-                        text: "\(song.artist) — \(song.album)",
-                        font: .system(size: 10),
-                        color: .secondary
-                    )
-                    .onTapGesture { navigateToArtist(song.artistId) }
+                    Button {
+                        navigateToArtist(song.artistId)
+                    } label: {
+                        MarqueeText(
+                            text: "\(song.artist) — \(song.album)",
+                            font: .system(size: 12),
+                            color: .secondary
+                        )
+                        .frame(width: metadataTextWidth, height: 15, alignment: .leading)
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .disabled(song.artistId.isEmpty)
+                    .accessibilityLabel("Artist: \(song.artist)")
+                    .accessibilityHint("Show \(song.artist)")
+                    .help("Go to Artist")
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .offset(y: 0.5)
                 .contextMenu {
                     SongContextMenu(song: song)
                 }
             }
-            .padding(.leading, 8) // Extra left spacing
+            .frame(width: centerWidth, height: 34, alignment: .leading)
         } else {
-            HStack(spacing: 10) {
+            HStack(spacing: 8) {
                 RoundedRectangle(cornerRadius: 8, style: .continuous)
                     .fill(.quaternary)
                     .frame(width: albumArtSize, height: albumArtSize)
 
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Not Playing")
-                        .font(.system(size: 12, weight: .bold))
+                        .font(.system(size: 13, weight: .semibold))
                         .foregroundStyle(.secondary)
                     Text("Select a song")
-                        .font(.system(size: 10))
+                        .font(.system(size: 12))
                         .foregroundStyle(.tertiary)
                 }
             }
-            .padding(.leading, 8)
+            .frame(width: centerWidth, height: 34, alignment: .leading)
         }
     }
 
-    // MARK: - Right Controls (14px spacing per spec)
+    // MARK: - Metadata More accessory (host x536, or x499 with route picker)
 
-    private func rightControls(metrics: LayoutMetrics) -> some View {
-        HStack(spacing: metrics.controlSpacing) {
-            // Volume (always visible)
-            HStack(spacing: 6) {
-                Image(systemName: volumeIcon)
-                    .font(.system(size: 11))
-                    .foregroundStyle(.secondary)
-                    .frame(width: 14)
+    @ViewBuilder
+    private var moreControl: some View {
+        if let song = appState.nowPlaying {
+            Menu {
+                if !showsRoutePicker {
+                    HStack(spacing: 8) {
+                        Label("AirPlay", systemImage: "airplayaudio")
+                        Spacer(minLength: 8)
+                        AirPlayButton()
+                            .frame(width: 24, height: 20)
+                    }
+                    .accessibilityElement(children: .contain)
+                    .accessibilityLabel("AirPlay")
 
-                Slider(value: Binding(
-                    get: { Double(appState.volume) },
-                    set: { appState.volume = Float($0) }
-                ), in: 0...1)
-                    .frame(width: metrics.volumeSliderWidth)
-                    .controlSize(.mini)
-                    .tint(.primary.opacity(0.6))
-            }
-
-            // AutoPlay ∞
-            AutoPlayToggle()
-
-            if let song = appState.nowPlaying {
-                QuickCaptureMenu(song: song) {
-                    Image(systemName: "bolt.circle")
-                        .font(.system(size: 12))
+                    Divider()
                 }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-                .help("Quick Capture")
-            }
-
-            // Queue
-            Button {
-                appState.isQueueVisible.toggle()
+                SongContextMenu(song: song)
             } label: {
-                Image(systemName: "list.bullet")
-                    .font(.system(size: 12))
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(controlInk)
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(appState.isQueueVisible ? Color.accentColor : .secondary)
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .foregroundStyle(controlInk)
+            .tint(controlInk)
+            .frame(width: 36, height: 36)
+            .accessibilityLabel("More")
+            .accessibilityHint("Show actions for the current song")
+            .accessibilityIdentifier("FooterMore")
+        } else {
+            Button {} label: {
+                Image(systemName: "ellipsis")
+                    .font(.system(size: 14, weight: .semibold))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(NativeTransportButtonStyle())
+            .frame(width: 36, height: 36)
+            .disabled(true)
+            .accessibilityLabel("More")
+            .accessibilityIdentifier("FooterMore")
+        }
+    }
 
-            // Lyrics
+    // MARK: - Right Controls (host-local x544,581,618,655)
+    // The captured four-slot sequence is More, Lyrics, Up Next, and Volume.
+    // AirPlay remains available from More without inventing a fifth rest slot.
+
+    private func rightControls() -> some View {
+        HStack(spacing: 1) {
             Button {
-                appState.isLyricsPanelVisible.toggle()
+                appState.toggleNowPlayingInspector(.lyrics)
             } label: {
                 Image(systemName: "quote.bubble")
-                    .font(.system(size: 12))
+                    .font(.system(size: 18))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .foregroundStyle(appState.isLyricsPanelVisible ? Color.accentColor : .secondary)
+            .buttonStyle(NativeTransportButtonStyle())
+            .foregroundStyle(appState.nowPlayingInspector == .lyrics ? Color.accentColor : controlInk)
+            .accessibilityLabel("Lyrics")
+            .accessibilityHint("Show or hide lyrics")
+            .accessibilityIdentifier("FooterLyrics")
+            .opacity(isVolumeExpanded ? 0 : 1)
+            .allowsHitTesting(!isVolumeExpanded)
+            .accessibilityHidden(isVolumeExpanded)
+            .accessibilityAddTraits(appState.nowPlayingInspector == .lyrics ? [.isButton, .isSelected] : .isButton)
+
+            Button {
+                appState.toggleNowPlayingInspector(.queue)
+            } label: {
+                Image(systemName: "list.bullet")
+                    .font(.system(size: 18))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(NativeTransportButtonStyle())
+            .foregroundStyle(appState.nowPlayingInspector == .queue ? Color.accentColor : controlInk)
+            .accessibilityLabel("Up Next")
+            .accessibilityHint("Show or hide the queue")
+            .accessibilityIdentifier("FooterQueue")
+            .opacity(isVolumeExpanded ? 0 : 1)
+            .allowsHitTesting(!isVolumeExpanded)
+            .accessibilityHidden(isVolumeExpanded)
+            .accessibilityAddTraits(appState.nowPlayingInspector == .queue ? [.isButton, .isSelected] : .isButton)
+
+            if showsRoutePicker {
+                AirPlayButton()
+                    .frame(width: 36, height: 36)
+                    .accessibilityIdentifier("FooterAirPlay")
+                    .accessibilityLabel("AirPlay")
+                    .opacity(isVolumeExpanded ? 0 : 1)
+                    .allowsHitTesting(!isVolumeExpanded)
+                    .accessibilityHidden(isVolumeExpanded)
+            }
+
+            InlineVolumeControl(isPresented: $isVolumeExpanded)
+        }
+        .frame(width: rightControlsWidth, height: 36, alignment: .topLeading)
+        .offset(x: rightControlsOffsetX, y: 0)
+    }
+
+    // MARK: - Volume (native inline expansion)
+
+    // September 9 empty-state capture: unchanged 700×54 footer; expanded
+    // 149×40 capsule at host (544,7), speaker at (655,9), slider hit 107×24.
+    // Public glass and rail colors remain provisional. Hover-open,
+    // mute, loaded-state overlap, and native dismissal timing are not established.
+    private struct InlineVolumeControl: View {
+        @Environment(AppState.self) private var appState
+        @Environment(\.colorScheme) private var colorScheme
+        @Binding var isPresented: Bool
+        @State private var wheelController = FooterVolumeWheelController()
+
+        private var speaker: some View {
+            speakerButton(expanded: false)
+        }
+
+        private var expandedSpeaker: some View {
+            speakerButton(expanded: true)
+        }
+
+        private func speakerButton(expanded: Bool) -> some View {
+            Button { isPresented = !expanded } label: {
+                Image(systemName: volumeSymbol)
+                    .font(.system(size: 15))
+                    .frame(width: 36, height: 36)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(NativeTransportButtonStyle())
+            .foregroundStyle(colorScheme == .dark ? Color.white : .black)
+            .accessibilityIdentifier("FooterVolume")
+            .accessibilityLabel("Volume")
+            .accessibilityValue("\(Int(appState.volume * 100)) percent")
+            .accessibilityHint(isPresented ? "Volume control expanded" : "Show volume control")
+            .help(expanded ? "Close Volume Control" : "Show Volume Control")
+            .frame(width: 36, height: 36)
+        }
+
+        var body: some View {
+            speaker
+                .opacity(isPresented ? 0 : 1)
+                .allowsHitTesting(!isPresented)
+                .accessibilityHidden(isPresented)
+                .background(VolumeWheelRegion(controller: wheelController))
+                .overlay(alignment: .bottomTrailing) {
+                    ZStack(alignment: .topLeading) {
+                        if isPresented {
+                            CapturedVolumeSlider(value: Binding(
+                                get: { Double(appState.volume) },
+                                set: { appState.volume = Float($0) }
+                            ), wheelController: wheelController)
+                            .frame(width: 107, height: 24)
+                            .offset(x: 8, y: 8)
+                            .transition(.opacity)
+                        }
+                        expandedSpeaker.offset(x: 111, y: 2)
+                    }
+                    .frame(width: 149, height: 40, alignment: .topLeading)
+                    .background(alignment: .trailing) {
+                        Color.clear
+                            .frame(width: isPresented ? 149 : 36, height: 40)
+                            .modifier(GlassEffectModifier(shape: .capsule))
+                    }
+                    .opacity(isPresented ? 1 : 0)
+                    .allowsHitTesting(isPresented)
+                    .accessibilityHidden(!isPresented)
+                    .background {
+                        if isPresented { VolumeDismissObserver { isPresented = false } }
+                    }
+                    .offset(x: 2, y: 2)
+                }
+                .onAppear {
+                    wheelController.readVolume = { Double(appState.volume) }
+                    wheelController.writeVolume = { appState.volume = Float($0) }
+                }
+                .onDisappear { wheelController.cancel() }
+        }
+
+        private var volumeSymbol: String {
+            appState.volume <= 0.01 ? "speaker.slash.fill" : "speaker.wave.2.fill"
+        }
+    }
+
+    /// A real NSSlider retains native keyboard/focus/AX adjustment, but owns its
+    /// captured flat rail rendering and pointer mapping. No permanent thumb was
+    /// visible in the reference; hover/drag-specific decoration remains unknown.
+    private struct CapturedVolumeSlider: NSViewRepresentable {
+        @Binding var value: Double
+        let wheelController: FooterVolumeWheelController
+
+        func makeCoordinator() -> Coordinator { Coordinator(value: $value) }
+
+        func makeNSView(context: Context) -> RailSlider {
+            let slider = RailSlider(frame: NSRect(x: 0, y: 0, width: 107, height: 24))
+            slider.minValue = 0
+            slider.maxValue = 1
+            slider.isContinuous = true
+            slider.wheelController = wheelController
+            context.coordinator.wheelController = wheelController
+            // Retain keyboard/AX adjustment without AppKit's accent-colored ring.
+            slider.focusRingType = .none
+            slider.target = context.coordinator
+            slider.action = #selector(Coordinator.changed(_:))
+            slider.setAccessibilityIdentifier("FooterVolumeSlider")
+            slider.setAccessibilityLabel("Volume")
+            return slider
+        }
+
+        func updateNSView(_ slider: RailSlider, context: Context) {
+            context.coordinator.value = $value
+            slider.doubleValue = min(1, max(0, value))
+            slider.needsDisplay = true
+        }
+
+        static func dismantleNSView(_ slider: RailSlider, coordinator: Coordinator) {
+            slider.wheelController?.pointerTracking = false
+            slider.wheelController?.cancel()
+        }
+
+        @MainActor final class Coordinator: NSObject {
+            var value: Binding<Double>
+            var wheelController: FooterVolumeWheelController?
+            init(value: Binding<Double>) { self.value = value }
+            @objc func changed(_ slider: NSSlider) {
+                wheelController?.cancel()
+                value.wrappedValue = min(1, max(0, slider.doubleValue))
+                slider.needsDisplay = true
+            }
+        }
+
+        final class RailSlider: NSSlider {
+            var wheelController: FooterVolumeWheelController?
+            private var isPointerTracking = false
+            override var intrinsicContentSize: NSSize { NSSize(width: 107, height: 24) }
+
+            private var rail: NSRect {
+                NSRect(x: 8, y: (bounds.height - 8) / 2, width: bounds.width - 16, height: 8)
+            }
+
+            override func draw(_ dirtyRect: NSRect) {
+                // Response_4, September 9 light/empty capture: extended-sRGB black
+                // track alpha .2; opaque black fill. Dark colors remain provisional.
+                // Captured layer compositingFilter is "plusD". Public SDK exposes
+                // plusDarker but does not establish equivalence to that private
+                // layer filter (or its backdrop scope); blending remains unresolved.
+                let isDark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+                let trackColor = isDark
+                    ? NSColor.labelColor.withAlphaComponent(0.16)
+                    : NSColor(colorSpace: .extendedSRGB, components: [0, 0, 0, 0.2], count: 4)
+                let fillColor = isDark
+                    ? NSColor.white.withAlphaComponent(0.52)
+                    : NSColor(colorSpace: .extendedSRGB, components: [0, 0, 0, 1], count: 4)
+                trackColor.setFill()
+                NSBezierPath(roundedRect: rail, xRadius: 4, yRadius: 4).fill()
+                let amount = min(1, max(0, doubleValue))
+                if amount > 0 {
+                    NSGraphicsContext.saveGraphicsState()
+                    NSBezierPath(roundedRect: rail, xRadius: 4, yRadius: 4).addClip()
+                    fillColor.setFill()
+                    NSRect(x: rail.minX, y: rail.minY,
+                           width: rail.width * amount, height: rail.height).fill()
+                    NSGraphicsContext.restoreGraphicsState()
+                }
+            }
+
+            override func accessibilityFrame() -> NSRect {
+                guard let window else { return super.accessibilityFrame() }
+                return window.convertToScreen(convert(bounds, to: nil))
+            }
+
+            override func mouseDown(with event: NSEvent) {
+                guard isEnabled, let window else { return }
+                wheelController?.cancel()
+                window.makeFirstResponder(self)
+                isPointerTracking = true
+                wheelController?.pointerTracking = true
+                updatePointer(event)
+            }
+
+            override func mouseDragged(with event: NSEvent) {
+                guard isEnabled, isPointerTracking else { return }
+                updatePointer(event)
+            }
+
+            override func mouseUp(with event: NSEvent) {
+                guard isPointerTracking else { return }
+                isPointerTracking = false
+                wheelController?.pointerTracking = false
+                guard isEnabled else { return }
+                updatePointer(event)
+            }
+
+            override func scrollWheel(with event: NSEvent) {
+                guard isEnabled, !isPointerTracking else { return }
+                wheelController?.scrollWheel(with: event)
+            }
+
+            private func updatePointer(_ event: NSEvent) {
+                guard rail.width > 0 else { return }
+                let point = convert(event.locationInWindow, from: nil)
+                setVolume((point.x - rail.minX) / rail.width)
+            }
+
+            private func setVolume(_ value: Double) {
+                guard value.isFinite else { return }
+                let bounded = min(1, max(0, value))
+                guard bounded != doubleValue else { return }
+                doubleValue = bounded
+                needsDisplay = true
+                sendAction(action, to: target)
+            }
+        }
+    }
+
+    /// Local event observation does not activate the app or consume outside clicks.
+    /// Native hierarchy contains an outside-click detector; exact timing is unverified.
+    private struct VolumeDismissObserver: NSViewRepresentable {
+        let dismiss: () -> Void
+
+        func makeNSView(context: Context) -> DismissView {
+            let view = DismissView()
+            view.dismiss = dismiss
+            return view
+        }
+
+        func updateNSView(_ view: DismissView, context: Context) {
+            view.dismiss = dismiss
+        }
+
+        static func dismantleNSView(_ view: DismissView, coordinator: ()) {
+            view.stopObserving()
+        }
+
+        final class DismissView: NSView {
+            var dismiss: (() -> Void)?
+            private var monitor: Any?
+
+            override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+            override func viewDidMoveToWindow() {
+                super.viewDidMoveToWindow()
+                stopObserving()
+                guard window != nil else { return }
+                monitor = NSEvent.addLocalMonitorForEvents(
+                    matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown, .keyDown]
+                ) { [weak self] event in
+                    guard let self else { return event }
+                    if event.type == .keyDown {
+                        if event.keyCode == 53, event.window === self.window {
+                            self.dismiss?()
+                            return nil
+                        }
+                    } else if event.window !== self.window ||
+                                !self.bounds.contains(self.convert(event.locationInWindow, from: nil)) {
+                        self.dismiss?()
+                    }
+                    return event
+                }
+            }
+
+            func stopObserving() {
+                if let monitor { NSEvent.removeMonitor(monitor) }
+                monitor = nil
+            }
         }
     }
 
     // MARK: - Helpers
 
-    private func layoutMetrics(for width: CGFloat) -> LayoutMetrics {
-        switch width {
-        case ..<520:
-            LayoutMetrics(
-                controlsWidth: 118,
-                utilitiesWidth: 132,
-                horizontalPadding: 14,
-                sectionSpacing: 10,
-                controlSpacing: 10,
-                volumeSliderWidth: 38,
-                albumArtSize: 30
-            )
-        case ..<660:
-            LayoutMetrics(
-                controlsWidth: 132,
-                utilitiesWidth: 150,
-                horizontalPadding: 16,
-                sectionSpacing: 12,
-                controlSpacing: 12,
-                volumeSliderWidth: 48,
-                albumArtSize: 32
-            )
-        case ..<820:
-            LayoutMetrics(
-                controlsWidth: 144,
-                utilitiesWidth: 166,
-                horizontalPadding: 18,
-                sectionSpacing: 16,
-                controlSpacing: 13,
-                volumeSliderWidth: 54,
-                albumArtSize: 34
-            )
-        default:
-            LayoutMetrics(
-                controlsWidth: 150,
-                utilitiesWidth: 178,
-                horizontalPadding: 20,
-                sectionSpacing: 20,
-                controlSpacing: 14,
-                volumeSliderWidth: 60,
-                albumArtSize: 35
-            )
-        }
-    }
-
     private func navigateToAlbum(_ albumId: String) {
         guard !albumId.isEmpty else { return }
         appState.navigationTargetSongId = nil  // Clear any song highlight
+        appState.navigationTargetArtistId = nil
         appState.navigationTargetAlbumId = albumId
         appState.selectedSidebarItem = .albums
     }
 
     private func navigateToAlbumWithSong(albumId: String, songId: String) {
         guard !albumId.isEmpty else { return }
+        appState.navigationTargetArtistId = nil
         appState.navigationTargetSongId = songId  // Highlight this song
         appState.navigationTargetAlbumId = albumId
         appState.selectedSidebarItem = .albums
@@ -380,6 +974,8 @@ struct NowPlayingBar: View {
 
     private func navigateToArtist(_ artistId: String) {
         guard !artistId.isEmpty else { return }
+        appState.navigationTargetAlbumId = nil
+        appState.navigationTargetSongId = nil
         appState.navigationTargetArtistId = artistId
         appState.selectedSidebarItem = .artists
     }
@@ -419,25 +1015,32 @@ struct NowPlayingBar: View {
         }
     }
 
-    private var volumeIcon: String {
-        if appState.volume < 0.01 { return "speaker.slash.fill" }
-        else if appState.volume < 0.33 { return "speaker.wave.1.fill" }
-        else if appState.volume < 0.66 { return "speaker.wave.2.fill" }
-        else { return "speaker.wave.3.fill" }
-    }
-
     private var repeatIcon: String {
-        switch appState.playbackManager.repeatMode {
+        switch observedRepeatMode {
         case .off: return "repeat"
         case .all: return "repeat.circle.fill"
         case .one: return "repeat.1"
         }
     }
 
+    private var repeatAccessibilityLabel: String {
+        switch observedRepeatMode {
+        case .off: return "Repeat off"
+        case .all: return "Repeat all"
+        case .one: return "Repeat one"
+        }
+    }
+
     private func formatTime(_ time: TimeInterval) -> String {
-        let minutes = Int(time) / 60
-        let seconds = Int(time) % 60
-        return String(format: "%d:%02d", minutes, seconds)
+        let totalSeconds: Int
+        if !time.isFinite || time <= 0 {
+            totalSeconds = 0
+        } else if time >= Double(Int.max) {
+            totalSeconds = Int.max
+        } else {
+            totalSeconds = Int(time)
+        }
+        return String(format: "%d:%02d", totalSeconds / 60, totalSeconds % 60)
     }
 }
 
@@ -449,13 +1052,22 @@ private struct AlbumArtMenuButton: View {
     let size: CGFloat
 
     var body: some View {
-        EnvironmentAlbumArtView(coverArtId: song.coverArt, size: .miniBar)
-            .shadow(color: .black.opacity(0.2), radius: 2, x: 0, y: 1)
-            .contentShape(Rectangle())
-            .overlay { MenuTriggerView(song: song, size: size) }
-            .contextMenu {
-                menuItems
-            }
+        Menu {
+            menuItems
+        } label: {
+            EnvironmentAlbumArtView(coverArtId: song.coverArt, size: .miniBar)
+                .frame(width: size, height: size)
+                .contentShape(Rectangle())
+                .contextMenu {
+                    menuItems
+                }
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .frame(width: size, height: size)
+        .accessibilityLabel("\(song.title) artwork actions")
+        .accessibilityHint("Show actions for the current track")
+        .accessibilityIdentifier("FooterArtworkMenu")
     }
 
     @ViewBuilder
@@ -463,6 +1075,7 @@ private struct AlbumArtMenuButton: View {
         Button { navigateToAlbum(song.albumId) } label: {
             Label("Go to Album", systemImage: "square.stack")
         }
+        .disabled(song.albumId.isEmpty)
         Divider()
         Button { appState.showMiniPlayer() } label: {
             Label("MiniPlayer", systemImage: "pip")
@@ -475,97 +1088,9 @@ private struct AlbumArtMenuButton: View {
     private func navigateToAlbum(_ albumId: String) {
         guard !albumId.isEmpty else { return }
         appState.navigationTargetSongId = nil
+        appState.navigationTargetArtistId = nil
         appState.navigationTargetAlbumId = albumId
         appState.selectedSidebarItem = .albums
-    }
-
-    /// NSView overlay that intercepts left-click and shows NSMenu
-    struct MenuTriggerView: NSViewRepresentable {
-        @Environment(AppState.self) private var appState
-        let song: Song
-        let size: CGFloat
-
-        func makeNSView(context: Context) -> MenuTriggerNSView {
-            let view = MenuTriggerNSView(frame: NSRect(x: 0, y: 0, width: size, height: size))
-            view.wantsLayer = true
-            view.layer?.backgroundColor = .clear
-            view.context = context.coordinator
-            return view
-        }
-
-        func updateNSView(_ nsView: MenuTriggerNSView, context: Context) {
-            nsView.context = context.coordinator
-        }
-
-        func makeCoordinator() -> Coordinator {
-            Coordinator(appState: appState, song: song)
-        }
-
-        class Coordinator {
-            let appState: AppState
-            let song: Song
-            init(appState: AppState, song: Song) {
-                self.appState = appState
-                self.song = song
-            }
-        }
-    }
-}
-
-private class MenuTriggerNSView: NSView {
-    var context: AlbumArtMenuButton.MenuTriggerView.Coordinator?
-
-    override func mouseDown(with event: NSEvent) {
-        guard let context else { super.mouseDown(with: event); return }
-
-        let menu = NSMenu()
-        let handler = MenuActionHandler(appState: context.appState, song: context.song)
-        // Prevent dealloc during menu display
-        objc_setAssociatedObject(menu, "handler", handler, .OBJC_ASSOCIATION_RETAIN)
-
-        let goToAlbum = NSMenuItem(title: "Go to Album", action: #selector(MenuActionHandler.goToAlbum), keyEquivalent: "")
-        goToAlbum.image = NSImage(systemSymbolName: "square.stack", accessibilityDescription: nil)
-        goToAlbum.target = handler
-        menu.addItem(goToAlbum)
-
-        menu.addItem(.separator())
-
-        let miniPlayer = NSMenuItem(title: "MiniPlayer", action: #selector(MenuActionHandler.showMiniPlayer), keyEquivalent: "")
-        miniPlayer.image = NSImage(systemSymbolName: "pip", accessibilityDescription: nil)
-        miniPlayer.target = handler
-        menu.addItem(miniPlayer)
-
-        let fullScreen = NSMenuItem(title: "Full Screen", action: #selector(MenuActionHandler.enterImmersive), keyEquivalent: "")
-        fullScreen.image = NSImage(systemSymbolName: "arrow.up.left.and.arrow.down.right", accessibilityDescription: nil)
-        fullScreen.target = handler
-        menu.addItem(fullScreen)
-
-        menu.popUp(positioning: nil, at: NSPoint(x: 0, y: bounds.height), in: self)
-    }
-}
-
-@MainActor
-private class MenuActionHandler: NSObject {
-    let appState: AppState
-    let song: Song
-
-    init(appState: AppState, song: Song) {
-        self.appState = appState
-        self.song = song
-    }
-
-    @objc func goToAlbum() {
-        appState.navigationTargetSongId = nil
-        appState.navigationTargetAlbumId = song.albumId
-        appState.selectedSidebarItem = .albums
-    }
-
-    @objc func showMiniPlayer() {
-        appState.showMiniPlayer()
-    }
-
-    @objc func enterImmersive() {
-        appState.enterImmersiveMode()
     }
 }
 
@@ -595,11 +1120,13 @@ struct MarqueeText: View {
     let font: Font
     var color: Color = .primary
 
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isHovered = false
     @State private var shouldScroll = false
     @State private var textWidth: CGFloat = 0
     @State private var containerWidth: CGFloat = 0
     @State private var offset: CGFloat = 0
+    @State private var scrollTask: Task<Void, Never>?
 
     private let scrollSpeed: CGFloat = 30
     private let hoverDelay: TimeInterval = 1.0
@@ -624,6 +1151,7 @@ struct MarqueeText: View {
                             .onChange(of: text) { _, _ in
                                 textWidth = textGeo.size.width
                                 resetScroll()
+                                if isHovered && isTruncated { startScrollAfterDelay() }
                             }
                     })
                     .hidden()
@@ -655,18 +1183,27 @@ struct MarqueeText: View {
             .onChange(of: geometry.size.width) { _, newWidth in
                 containerWidth = newWidth
                 resetScroll()
+                if isHovered && isTruncated { startScrollAfterDelay() }
             }
         }
         .frame(height: 16)
         .contentShape(Rectangle())
         .onHover { hovering in
             isHovered = hovering
-            if hovering && isTruncated {
+            if hovering && isTruncated && !reduceMotion {
                 startScrollAfterDelay()
             } else {
                 resetScroll()
             }
         }
+        .onChange(of: reduceMotion) { _, isReduced in
+            if isReduced {
+                resetScroll()
+            } else if isHovered && isTruncated {
+                startScrollAfterDelay()
+            }
+        }
+        .onDisappear { resetScroll() }
     }
 
     private var scrollDuration: TimeInterval {
@@ -676,47 +1213,152 @@ struct MarqueeText: View {
     }
 
     private func startScrollAfterDelay() {
-        Task {
-            try? await Task.sleep(for: .seconds(hoverDelay))
-            guard isHovered, isTruncated else { return }
-            await MainActor.run {
-                shouldScroll = true
+        scrollTask?.cancel()
+        guard isHovered, isTruncated, !reduceMotion else { return }
+
+        scrollTask = Task { @MainActor in
+            do {
+                try await Task.sleep(for: .seconds(hoverDelay))
+            } catch {
+                return
+            }
+            guard !Task.isCancelled, isHovered, isTruncated, !reduceMotion else { return }
+            shouldScroll = true
+            offset = 0
+
+            while !Task.isCancelled, isHovered, isTruncated, !reduceMotion {
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, isHovered, isTruncated, !reduceMotion else { return }
+
+                let distance = textWidth - containerWidth + 20
+                withAnimation(.linear(duration: scrollDuration)) {
+                    offset = -distance
+                }
+                do {
+                    try await Task.sleep(for: .seconds(scrollDuration))
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, isHovered, isTruncated, !reduceMotion else { return }
                 offset = 0
-                startScrollLoop()
-            }
-        }
-    }
 
-    private func startScrollLoop() {
-        let distance = textWidth - containerWidth + 20
-
-        // Small delay then smooth animate to scrolled position
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            withAnimation(.linear(duration: scrollDuration)) {
-                offset = -distance
-            }
-        }
-
-        Task {
-            try? await Task.sleep(for: .seconds(scrollDuration + pauseAtEnd + 0.05))
-            guard isHovered else { return }
-            await MainActor.run {
-                offset = 0  // Jump back instantly
-                if isHovered && isTruncated {
-                    Task {
-                        try? await Task.sleep(for: .seconds(pauseAtEnd))
-                        if isHovered {
-                            startScrollLoop()
-                        }
-                    }
+                do {
+                    try await Task.sleep(for: .seconds(pauseAtEnd))
+                } catch {
+                    return
                 }
             }
         }
     }
 
     private func resetScroll() {
+        scrollTask?.cancel()
+        scrollTask = nil
         shouldScroll = false
         offset = 0
+    }
+}
+
+/// Shared by the open rail and the closed speaker hit region. Wheel deltas
+/// accumulate into a bounded target; a short, monotonic ramp smooths BOTH the
+/// displayed rail and actual audio gain without overshoot or queued detents.
+/// Calibration is application tuning, not a recovered Apple timing constant.
+@MainActor
+final class FooterVolumeWheelController {
+    var readVolume: () -> Double = { 1 }
+    var writeVolume: (Double) -> Void = { _ in }
+    var pointerTracking = false
+    private(set) var targetVolume: Double?
+    private var timer: Timer?
+    private var lastTick = 0.0
+    private var response = 0.045
+
+    func scrollWheel(with event: NSEvent) {
+        guard !pointerTracking, event.momentumPhase.isEmpty else { return }
+        let x = event.scrollingDeltaX, y = event.scrollingDeltaY
+        let delta = abs(y) >= abs(x) ? y : x
+        guard delta.isFinite, delta != 0 else { return }
+        let current = readVolume()
+        guard current.isFinite else { return }
+        let step = event.hasPreciseScrollingDeltas ? 0.0025 : 0.02
+        let target = min(1, max(0, (targetVolume ?? current) + Double(delta) * step))
+        targetVolume = target
+        response = event.hasPreciseScrollingDeltas ? 0.028 : 0.045
+        if NSWorkspace.shared.accessibilityDisplayShouldReduceMotion || abs(target - current) < 0.0001 {
+            writeVolume(target)
+            cancel()
+            return
+        }
+        guard timer == nil else { return }
+        lastTick = ProcessInfo.processInfo.systemUptime
+        let next = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.tick() }
+        }
+        timer = next
+        RunLoop.main.add(next, forMode: .common)
+    }
+
+    private func tick() {
+        guard let target = targetVolume else { cancel(); return }
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = max(0, now - lastTick)
+        lastTick = now
+        let current = readVolume()
+        let next = current + (target - current) * (1 - exp(-elapsed / response))
+        if abs(target - next) < 0.0001 {
+            writeVolume(target)
+            cancel()
+        } else {
+            writeVolume(next)
+        }
+    }
+
+    func cancel() {
+        timer?.invalidate()
+        timer = nil
+        targetVolume = nil
+    }
+}
+
+private struct VolumeWheelRegion: NSViewRepresentable {
+    let controller: FooterVolumeWheelController
+    func makeNSView(context: Context) -> FooterVolumeWheelRegion {
+        let view = FooterVolumeWheelRegion()
+        view.controller = controller
+        return view
+    }
+    func updateNSView(_ view: FooterVolumeWheelRegion, context: Context) { view.controller = controller }
+    static func dismantleNSView(_ view: FooterVolumeWheelRegion, coordinator: ()) { view.stopMonitoring() }
+}
+
+/// Observe wheel events only inside this speaker's own window-local bounds;
+/// the SwiftUI button remains the click target and never has to expand first.
+final class FooterVolumeWheelRegion: NSView {
+    var controller: FooterVolumeWheelController?
+    private var monitor: Any?
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        stopMonitoring()
+        guard window != nil else { return }
+        monitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            self?.handleScrollWheel(event, in: event.window, at: event.locationInWindow) == true ? nil : event
+        }
+    }
+    @discardableResult
+    func handleScrollWheel(_ event: NSEvent, in sourceWindow: NSWindow?, at point: NSPoint) -> Bool {
+        guard let window, sourceWindow === window, !isHiddenOrHasHiddenAncestor,
+              bounds.contains(convert(point, from: nil)), let controller else { return false }
+        controller.scrollWheel(with: event)
+        return true
+    }
+    func stopMonitoring() {
+        if let monitor { NSEvent.removeMonitor(monitor) }
+        monitor = nil
     }
 }
 

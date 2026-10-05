@@ -149,9 +149,9 @@ struct GeneralSettingsView: View {
     @AppStorage("showSidebarFavorites") private var showSidebarFavorites = true
     @AppStorage("showSidebarRecentlyAdded") private var showSidebarRecentlyAdded = true
     @AppStorage("showSidebarRecentlyPlayed") private var showSidebarRecentlyPlayed = true
+    @AppStorage("showSidebarNewMusic") private var showSidebarNewMusic = true
     @AppStorage("showSidebarRadio") private var showSidebarRadio = true
     @AppStorage("showSidebarDownloads") private var showSidebarDownloads = true
-    @AppStorage(FetcherContractSettings.isEnabledKey) private var enableFetcherSourceBrowser = false
 
     var body: some View {
         Form {
@@ -167,16 +167,13 @@ struct GeneralSettingsView: View {
                     Text("Songs").tag(SidebarItem.songs.rawValue)
                     Text("Recently Added").tag(SidebarItem.recentlyAdded.rawValue)
                     Text("Recently Played").tag(SidebarItem.recentlyPlayed.rawValue)
-                    if enableFetcherSourceBrowser {
-                        Text("Sources").tag(SidebarItem.fetcherSources.rawValue)
-                    }
                 }
 
                 Toggle("Start Minimized", isOn: $startMinimized)
             }
 
             Section("Notifications") {
-                Toggle("Track Changes", isOn: $showNotifications)
+                Toggle("When song changes", isOn: $showNotifications)
                 Toggle("Lyrics", isOn: $showLyricsInNotifications)
                     .disabled(!showNotifications)
                 Toggle("New Music", isOn: $showNewMusicNotifications)
@@ -200,6 +197,7 @@ struct GeneralSettingsView: View {
                 Toggle("Liked Songs", isOn: $showSidebarFavorites)
                 Toggle("Recently Added", isOn: $showSidebarRecentlyAdded)
                 Toggle("Recently Played", isOn: $showSidebarRecentlyPlayed)
+                Toggle("New Music", isOn: $showSidebarNewMusic)
                 Toggle("Radio", isOn: $showSidebarRadio)
                 Toggle("Downloads", isOn: $showSidebarDownloads)
             } header: {
@@ -217,6 +215,7 @@ struct GeneralSettingsView: View {
 // MARK: - Playback Settings
 
 struct PlaybackSettingsView: View {
+    @Environment(AppState.self) private var appState
     @AppStorage("crossfadeDuration") private var crossfadeDuration = 0.0
     @AppStorage("autoPlayOnLaunch") private var autoPlayOnLaunch = false
     @AppStorage("rememberPlaybackPosition") private var rememberPlaybackPosition = true
@@ -264,7 +263,7 @@ struct PlaybackSettingsView: View {
             Section("Lyrics") {
                 Toggle("Fetch Lyrics Automatically", isOn: $lyricsAutoFetch)
 
-                Text("Automatically search for lyrics when a song starts playing. Uses LRCLIB as external source.")
+                Text("Automatically look up lyrics on the library server when a song starts playing. This build does not use an external lyrics service.")
                     .settingsDescription()
             }
 
@@ -281,6 +280,9 @@ struct PlaybackSettingsView: View {
         }
         .formStyle(.grouped)
         .padding()
+        .onChange(of: crossfadeDuration) { _, duration in
+            Task { await appState.audioActor.setCrossfadeDuration(duration) }
+        }
     }
 }
 
@@ -295,6 +297,7 @@ struct LibrarySettingsView: View {
 
     @State private var musicFolders: [MusicFolder] = []
     @State private var isLoadingFolders = false
+    @State private var musicFoldersError: String?
     @State private var validationRequestId: String?
     @State private var duplicateRequestId: String?
     @State private var operationStatus: String?
@@ -311,6 +314,21 @@ struct LibrarySettingsView: View {
                         ProgressView()
                             .controlSize(.small)
                     }
+                } else if let musicFoldersError {
+                    LabeledContent("Music Folder") {
+                        HStack(spacing: 8) {
+                            Text("Couldn't load folders")
+                                .foregroundStyle(.red)
+                            Button("Retry") {
+                                Task { await loadFolders() }
+                            }
+                            .disabled(isLoadingFolders)
+                        }
+                    }
+                    Text(musicFoldersError)
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .textSelection(.enabled)
                 } else if musicFolders.isEmpty {
                     LabeledContent("Music Folder", value: "No folders found")
                 } else {
@@ -352,7 +370,10 @@ struct LibrarySettingsView: View {
                     if let status = operationStatus {
                         Text(status)
                             .font(.caption)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(
+                                status.localizedCaseInsensitiveContains("failed") ? Color.red : Color.secondary
+                            )
+                            .textSelection(.enabled)
                     }
                 } header: {
                     Text("Companion Service")
@@ -446,28 +467,32 @@ struct LibrarySettingsView: View {
     }
 
     private func requestValidateLibrary() {
-        guard let manager = appState.companionServiceManager else { return }
+        guard let manager = appState.companionServiceManager else {
+            operationStatus = "Companion service is unavailable."
+            return
+        }
         do {
             let payload: [String: Any] = ["scan_all": true]
             let requestId = try manager.createRequest(type: "validate", payload: payload)
             validationRequestId = requestId
             operationStatus = "Validation requested..."
         } catch {
-            operationStatus = "Failed to create validation request"
-            print("Failed to request library validation: \(error)")
+            operationStatus = "Failed to request library validation: \(error.localizedDescription)"
         }
     }
 
     private func requestScanDuplicates() {
-        guard let manager = appState.companionServiceManager else { return }
+        guard let manager = appState.companionServiceManager else {
+            operationStatus = "Companion service is unavailable."
+            return
+        }
         do {
             let payload: [String: Any] = ["scan_all": true]
             let requestId = try manager.createRequest(type: "fingerprint", payload: payload)
             duplicateRequestId = requestId
             operationStatus = "Duplicate scan requested..."
         } catch {
-            operationStatus = "Failed to create duplicate scan request"
-            print("Failed to request duplicate scan: \(error)")
+            operationStatus = "Failed to request duplicate scan: \(error.localizedDescription)"
         }
     }
 
@@ -507,12 +532,14 @@ struct LibrarySettingsView: View {
 
     private func loadFolders() async {
         isLoadingFolders = true
+        musicFoldersError = nil
+        defer { isLoadingFolders = false }
         do {
             musicFolders = try await appState.networkActor.fetchMusicFolders()
         } catch {
-            print("Failed to load music folders: \(error)")
+            musicFolders = []
+            musicFoldersError = "Music folders couldn't be loaded: \(error.localizedDescription)"
         }
-        isLoadingFolders = false
     }
 }
 
@@ -529,6 +556,7 @@ struct CacheSettingsView: View {
     @State private var cacheStats: CacheStats?
     @State private var isCalculating = false
     @State private var isClearing = false
+    @State private var cacheClearError: String?
 
     private var cacheLocationURL: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
@@ -583,7 +611,7 @@ struct CacheSettingsView: View {
                 }
             }
 
-            Section("Cache Limit") {
+            Section("Playback Cache Limit") {
                 Picker("Maximum Size", selection: $maxCacheSize) {
                     Text("1 GB").tag(1.0)
                     Text("2 GB").tag(2.0)
@@ -595,7 +623,7 @@ struct CacheSettingsView: View {
                 }
 
                 if maxCacheSize > 0, let stats = cacheStats {
-                    let used = Double(stats.totalSize) / (1024 * 1024 * 1024)
+                    let used = Double(stats.audioSize) / (1024 * 1024 * 1024)
                     let percentage = min(used / maxCacheSize, 1.0)
 
                     VStack(alignment: .leading, spacing: 4) {
@@ -607,6 +635,9 @@ struct CacheSettingsView: View {
                     }
                 }
             }
+
+            Text("The limit applies to cached playback audio, not offline downloads or artwork. Playback cache is trimmed as new audio is cached.")
+                .settingsDescription()
 
             Section("Manage Storage") {
                 Button {
@@ -672,6 +703,12 @@ struct CacheSettingsView: View {
                 .disabled(isClearing || cacheStats?.cacheSize == 0)
             }
 
+            if let cacheClearError {
+                Label(cacheClearError, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .textSelection(.enabled)
+            }
+
             Section("Cache Location") {
                 LabeledContent("Location") {
                     Button {
@@ -693,6 +730,13 @@ struct CacheSettingsView: View {
         .task {
             await refreshStats()
         }
+        .onChange(of: maxCacheSize) { _, gigabytes in
+            Task {
+                await appState.cacheActor.setMaxAudioCacheSize(
+                    CacheActor.audioCacheLimitBytes(gigabytes: gigabytes)
+                )
+            }
+        }
     }
 
     private func refreshStats() async {
@@ -702,24 +746,42 @@ struct CacheSettingsView: View {
     }
 
     private func clearArtwork() async {
+        guard !isClearing else { return }
         isClearing = true
-        try? await appState.cacheActor.clearArtworkCache()
+        cacheClearError = nil
+        defer { isClearing = false }
+        do {
+            try await appState.cacheActor.clearArtworkCache()
+        } catch {
+            cacheClearError = "Couldn't clear artwork cache: \(error.localizedDescription) Some files may already have been removed."
+        }
         await refreshStats()
-        isClearing = false
     }
 
     private func clearAudio() async {
+        guard !isClearing else { return }
         isClearing = true
-        try? await appState.cacheActor.clearAudioCache()
+        cacheClearError = nil
+        defer { isClearing = false }
+        do {
+            try await appState.cacheActor.clearAudioCache()
+        } catch {
+            cacheClearError = "Couldn't clear playback cache: \(error.localizedDescription) Some files may already have been removed."
+        }
         await refreshStats()
-        isClearing = false
     }
 
     private func clearAllCache() async {
+        guard !isClearing else { return }
         isClearing = true
-        await appState.cacheActor.clearAll()
+        cacheClearError = nil
+        defer { isClearing = false }
+        do {
+            try await appState.cacheActor.clearAll()
+        } catch {
+            cacheClearError = "Couldn't clear all cache: \(error.localizedDescription) Some files may already have been removed."
+        }
         await refreshStats()
-        isClearing = false
     }
 }
 
@@ -794,22 +856,36 @@ struct KeyboardShortcutsView: View {
                 ShortcutRow(action: "Stop", shortcut: "⌘.")
                 ShortcutRow(action: "Next Track", shortcut: "⌘→")
                 ShortcutRow(action: "Previous Track", shortcut: "⌘←")
+                ShortcutRow(action: "Seek Back", shortcut: "←")
+                ShortcutRow(action: "Seek Forward", shortcut: "→")
                 ShortcutRow(action: "Volume Up", shortcut: "⌘↑")
                 ShortcutRow(action: "Volume Down", shortcut: "⌘↓")
                 ShortcutRow(action: "Toggle Shuffle", shortcut: "⌘S")
                 ShortcutRow(action: "Cycle Repeat", shortcut: "⌘R")
             }
 
+            Section("Curation") {
+                ShortcutRow(action: "Curation Command…", shortcut: "⌘K")
+                ShortcutRow(action: "Admit Current Song", shortcut: "⇧⌘A")
+                ShortcutRow(action: "Mark Interesting", shortcut: "⇧⌘G")
+                ShortcutRow(action: "Love Current Song", shortcut: "⇧⌘L")
+                ShortcutRow(action: "Add to Playlist…", shortcut: "⇧⌘P")
+            }
+
             Section("Navigation") {
                 ShortcutRow(action: "Search", shortcut: "⌘F")
                 ShortcutRow(action: "Show Queue", shortcut: "⌘U")
                 ShortcutRow(action: "Show Lyrics", shortcut: "⌘L")
-                ShortcutRow(action: "Mini Player", shortcut: "⌘⇧M")
-                ShortcutRow(action: "Immersive Mode", shortcut: "⌘⇧F")
+                ShortcutRow(action: "Toggle Sidebar", shortcut: "⌘\\")
+                ShortcutRow(action: "Mini Player", shortcut: "⇧⌘M")
+                ShortcutRow(action: "Immersive Mode", shortcut: "⇧⌘F")
             }
 
             Section("File") {
                 ShortcutRow(action: "New Playlist", shortcut: "⌘N")
+            }
+
+            Section("Song") {
                 ShortcutRow(action: "Get Info", shortcut: "⌘I")
             }
 
@@ -820,7 +896,7 @@ struct KeyboardShortcutsView: View {
             }
 
             Section("Queue") {
-                ShortcutRow(action: "Remove from Queue", shortcut: "Delete")
+                ShortcutRow(action: "Remove Selected from Queue", shortcut: "Delete")
             }
         }
         .formStyle(.grouped)
@@ -921,10 +997,11 @@ struct AdvancedSettingsView: View {
     @Environment(AppState.self) private var appState
     @AppStorage("debugLoggingEnabled") private var debugLoggingEnabled = false
     @AppStorage("showDeveloperOptions") private var showDeveloperOptions = false
-    @AppStorage(FetcherContractSettings.isEnabledKey) private var enableFetcherSourceBrowser = false
-    @AppStorage(FetcherContractSettings.fixtureDirectoryKey) private var fetcherContractFixtureDirectory = ""
 
     @State private var showResetConfirmation = false
+    @State private var isExportingDiagnostics = false
+    @State private var diagnosticsExportMessage: String?
+    @State private var diagnosticsExportFailed = false
 
     private var cacheLocation: String {
         let cacheDir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -962,42 +1039,25 @@ struct AdvancedSettingsView: View {
                 Toggle("Show Developer Options", isOn: $showDeveloperOptions)
 
                 if showDeveloperOptions {
-                    Button("Export Diagnostics") {
+                    Button(isExportingDiagnostics ? "Exporting Diagnostics…" : "Export Diagnostics") {
                         exportDiagnostics()
+                    }
+                    .disabled(isExportingDiagnostics)
+
+                    if let diagnosticsExportMessage {
+                        Label(
+                            diagnosticsExportMessage,
+                            systemImage: diagnosticsExportFailed ? "exclamationmark.triangle" : "checkmark.circle"
+                        )
+                        .font(.caption)
+                        .foregroundStyle(diagnosticsExportFailed ? Color.red : Color.secondary)
+                        .textSelection(.enabled)
                     }
 
                     Button("Simulate Connection Error") {
                         appState.connectionStatus = .error(.serverUnreachable(URL(string: "http://localhost")!))
                     }
                 }
-            }
-
-            Section {
-                Toggle("Enable Fetcher Source Browser", isOn: $enableFetcherSourceBrowser)
-
-                LabeledContent("Fixture Directory") {
-                    HStack {
-                        Text(fetcherFixtureDirectoryLabel)
-                            .font(.caption)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-
-                        Button("Choose...") {
-                            chooseFetcherFixtureDirectory()
-                        }
-                    }
-                }
-
-                if !fetcherContractFixtureDirectory.isEmpty {
-                    Button("Reveal Fixture Directory") {
-                        NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: fetcherContractFixtureDirectory)
-                    }
-                }
-            } header: {
-                Text("Fetcher Contract")
-            } footer: {
-                Text("Loads a local Fetcher JSON export as source evidence. Explicit candidate actions may stage Navidrome-matched songs in Resonance Waiting Room, but never write Fetcher state.")
-                    .settingsDescription()
             }
 
             Section("Reset") {
@@ -1019,15 +1079,6 @@ struct AdvancedSettingsView: View {
         } message: {
             Text("This will reset all preferences to their default values. This action cannot be undone.")
         }
-        .onChange(of: enableFetcherSourceBrowser) { _, isEnabled in
-            guard !isEnabled else { return }
-            if appState.selectedSidebarItem == .fetcherSources {
-                appState.selectedSidebarItem = .home
-            }
-            if UserDefaults.standard.string(forKey: "defaultViewOnLaunch") == SidebarItem.fetcherSources.rawValue {
-                UserDefaults.standard.set(SidebarItem.home.rawValue, forKey: "defaultViewOnLaunch")
-            }
-        }
     }
 
     private func openCacheFolder() {
@@ -1043,6 +1094,11 @@ struct AdvancedSettingsView: View {
     }
 
     private func exportDiagnostics() {
+        guard !isExportingDiagnostics else { return }
+        isExportingDiagnostics = true
+        diagnosticsExportMessage = nil
+        diagnosticsExportFailed = false
+
         // Collect diagnostic info
         let diagnostics = """
         Resonance Diagnostics Report
@@ -1057,7 +1113,7 @@ struct AdvancedSettingsView: View {
 
         Library Stats:
         - Artists: \(appState.artists.count)
-        - Albums: \(appState.albums.count)
+        - Admitted Albums: \(appState.admittedAlbumIds.subtracting(appState.hiddenAlbumIds).count)
         - Playlists: \(appState.playlists.count)
 
         Settings:
@@ -1069,30 +1125,19 @@ struct AdvancedSettingsView: View {
         savePanel.nameFieldStringValue = "resonance-diagnostics.txt"
 
         savePanel.begin { response in
-            if response == .OK, let url = savePanel.url {
-                try? diagnostics.write(to: url, atomically: true, encoding: .utf8)
+            guard response == .OK, let url = savePanel.url else {
+                isExportingDiagnostics = false
+                return
             }
-        }
-    }
 
-    private var fetcherFixtureDirectoryLabel: String {
-        fetcherContractFixtureDirectory.isEmpty ? "Not selected" : fetcherContractFixtureDirectory
-    }
-
-    private func chooseFetcherFixtureDirectory() {
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Choose"
-
-        if !fetcherContractFixtureDirectory.isEmpty {
-            panel.directoryURL = URL(fileURLWithPath: fetcherContractFixtureDirectory)
-        }
-
-        panel.begin { response in
-            guard response == .OK, let url = panel.url else { return }
-            fetcherContractFixtureDirectory = url.path
+            do {
+                try diagnostics.write(to: url, atomically: true, encoding: .utf8)
+                diagnosticsExportMessage = "Diagnostics saved as \(url.lastPathComponent)."
+            } catch {
+                diagnosticsExportFailed = true
+                diagnosticsExportMessage = "Couldn't save diagnostics: \(error.localizedDescription)"
+            }
+            isExportingDiagnostics = false
         }
     }
 
@@ -1100,19 +1145,21 @@ struct AdvancedSettingsView: View {
         // List of all settings keys to reset
         let settingsKeys = [
             "showMenuBarPlayer", "startMinimized", "showNotifications", "showLyricsInNotifications",
-            "defaultViewOnLaunch", "showSidebarListen", "showSidebarHome", "showSidebarWaitingRoom",
+            "showNewMusicNotifications", SettingsTab.storageKey, "defaultViewOnLaunch",
+            "showSidebarListen", "showSidebarHome", "showSidebarWaitingRoom",
             "showSidebarProjects", "showSidebarUnclassified",
             "showSidebarArtists", "showSidebarAlbums", "showSidebarSongs", "showSidebarGenres",
-            "showSidebarFolders", "showSidebarFavorites", "showSidebarRecentlyAdded",
+            "showSidebarFolders", "showSidebarFavorites", "showSidebarNewMusic", "showSidebarRecentlyAdded",
             "showSidebarRecentlyPlayed", "showSidebarRadio", "showSidebarDownloads",
             "crossfadeDuration", "autoPlayOnLaunch", "rememberPlaybackPosition",
-            "streamingQuality", "soundCheckEnabled", "lyricsAutoFetch", "selectedEQPreset", "replayGainMode",
-            "eq.enabled", "eq.presetId", "eq.customPresets",
+            "streamingQuality", "soundCheckEnabled", "lyricsAutoFetch", "replayGainMode",
             "maxCacheSize", "autoDownloadOnWifi", "libraryRefreshInterval",
             "appTheme", "accentColorOption", "showAlbumArtInSidebar", "useVibrantBackground",
             "showWaveformInNowPlaying", "debugLoggingEnabled", "showDeveloperOptions",
             "allowRemoteImages", "clearHistoryOnQuit",
             "minArtistAlbumCount", "minAlbumSongCount", "libraryMusicFolderId",
+            "artistLayoutStyle", "genreLayoutStyle", "foldersRootLayoutStyle", "folderDetailLayoutStyle",
+            "sidebarCollapsedGroups", "sidebarWidth", "songsColumnCustomization", "miniPlayerMode",
             FetcherContractSettings.isEnabledKey,
             FetcherContractSettings.fixtureDirectoryKey,
             ImportPolicyDefaults.autoAdmitNavidromeLibrary,
@@ -1128,6 +1175,18 @@ struct AdvancedSettingsView: View {
 
         // Force UI refresh
         UserDefaults.standard.synchronize()
+
+        // Settings changes are persisted immediately, but the live actors keep
+        // their applied values. Re-apply the registered defaults now instead
+        // of leaving Reset All effective only after relaunch.
+        let crossfadeDuration = UserDefaults.standard.double(forKey: "crossfadeDuration")
+        let maxCacheSizeGB = (UserDefaults.standard.object(forKey: "maxCacheSize") as? Double) ?? 5.0
+        Task {
+            await appState.audioActor.setCrossfadeDuration(crossfadeDuration)
+            await appState.cacheActor.setMaxAudioCacheSize(
+                CacheActor.audioCacheLimitBytes(gigabytes: maxCacheSizeGB)
+            )
+        }
     }
 }
 
@@ -1136,7 +1195,10 @@ struct PrivacySettingsView: View {
     @AppStorage("clearHistoryOnQuit") private var clearHistoryOnQuit = false
 
     @State private var showClearHistoryConfirmation = false
-    @State private var showExportPanel = false
+    @State private var isClearingHistory = false
+    @State private var isExportingUserData = false
+    @State private var historyActionMessage: String?
+    @State private var historyActionFailed = false
 
     var body: some View {
         Form {
@@ -1159,6 +1221,7 @@ struct PrivacySettingsView: View {
                 Button("Clear Play History Now...") {
                     showClearHistoryConfirmation = true
                 }
+                .disabled(isClearingHistory)
                 .confirmationDialog("Clear Play History?", isPresented: $showClearHistoryConfirmation) {
                     Button("Clear History", role: .destructive) {
                         clearPlayHistory()
@@ -1170,9 +1233,19 @@ struct PrivacySettingsView: View {
             }
 
             Section("Data") {
-                Button("Export My Data...") {
+                Button(isExportingUserData ? "Preparing Export…" : "Export My Data…") {
                     exportUserData()
                 }
+                .disabled(isExportingUserData)
+            }
+
+            if let historyActionMessage {
+                Label(
+                    historyActionMessage,
+                    systemImage: historyActionFailed ? "exclamationmark.triangle" : "checkmark.circle"
+                )
+                .foregroundStyle(historyActionFailed ? Color.red : Color.secondary)
+                .textSelection(.enabled)
             }
         }
         .formStyle(.grouped)
@@ -1180,36 +1253,94 @@ struct PrivacySettingsView: View {
     }
 
     private func clearPlayHistory() {
-        try? appState.databaseManager.write { db in
-            try db.execute(sql: "DELETE FROM play_history")
+        guard !isClearingHistory else { return }
+        isClearingHistory = true
+        historyActionMessage = nil
+        historyActionFailed = false
+        let databaseManager = appState.databaseManager
+
+        Task.detached {
+            do {
+                try databaseManager.write { db in
+                    try db.execute(sql: "DELETE FROM play_history")
+                }
+                await MainActor.run {
+                    isClearingHistory = false
+                    historyActionMessage = "Play history cleared."
+                }
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run {
+                    isClearingHistory = false
+                    historyActionFailed = true
+                    historyActionMessage = "Couldn't clear play history: \(message)"
+                }
+            }
         }
     }
 
     private func exportUserData() {
-        Task {
-            let history = (try? appState.databaseManager.loadPlayHistory(limit: 10000)) ?? []
+        guard !isExportingUserData else { return }
+        isExportingUserData = true
+        historyActionMessage = nil
+        historyActionFailed = false
+        let databaseManager = appState.databaseManager
 
-            let exportData: [String: Any] = [
-                "exportedAt": ISO8601DateFormatter().string(from: Date()),
-                "playHistory": history.map { item in
-                    [
-                        "songId": item.songId,
-                        "title": item.title,
-                        "artist": item.artist,
-                        "album": item.album,
-                        "playedAt": ISO8601DateFormatter().string(from: item.playedAt)
-                    ]
+        Task.detached {
+            do {
+                let history = try databaseManager.loadPlayHistory(limit: 10000)
+                let formatter = ISO8601DateFormatter()
+                let exportData: [String: Any] = [
+                    "exportedAt": formatter.string(from: Date()),
+                    "playHistory": history.map { item in
+                        [
+                            "songId": item.songId,
+                            "title": item.title,
+                            "artist": item.artist,
+                            "album": item.album,
+                            "playedAt": formatter.string(from: item.playedAt)
+                        ]
+                    }
+                ]
+                let jsonData = try JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted)
+                await MainActor.run {
+                    presentUserDataSavePanel(with: jsonData)
                 }
-            ]
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run {
+                    isExportingUserData = false
+                    historyActionFailed = true
+                    historyActionMessage = "Couldn't prepare data export: \(message)"
+                }
+            }
+        }
+    }
 
-            await MainActor.run {
-                if let jsonData = try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted) {
-                    let savePanel = NSSavePanel()
-                    savePanel.allowedContentTypes = [.json]
-                    savePanel.nameFieldStringValue = "resonance-data-export.json"
+    private func presentUserDataSavePanel(with jsonData: Data) {
+        let savePanel = NSSavePanel()
+        savePanel.allowedContentTypes = [.json]
+        savePanel.nameFieldStringValue = "resonance-data-export.json"
+        savePanel.begin { response in
+            guard response == .OK, let url = savePanel.url else {
+                isExportingUserData = false
+                return
+            }
 
-                    if savePanel.runModal() == .OK, let url = savePanel.url {
-                        try? jsonData.write(to: url)
+            Task.detached {
+                do {
+                    try jsonData.write(to: url, options: .atomic)
+                    await MainActor.run {
+                        isExportingUserData = false
+                        historyActionFailed = false
+                        historyActionMessage = "Data export saved as \(url.lastPathComponent)."
+                    }
+                } catch {
+                    let message = error.localizedDescription
+                    await MainActor.run {
+                        isExportingUserData = false
+                        historyActionFailed = true
+                        historyActionMessage = "Couldn't save data export: \(message)"
                     }
                 }
             }

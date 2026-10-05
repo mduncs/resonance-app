@@ -101,14 +101,10 @@ struct HiddenItemsView: View {
         do {
             try appState.databaseManager.unhideItem(id: item.itemId, type: item.itemType, serverId: serverId)
 
-            // Re-add to runtime arrays
+            // The full album catalog is demand-loaded; never turn it into a
+            // one-row partial array after an unhide.
             if item.itemType == "album" {
-                if let album = try? appState.databaseManager.loadAlbums(serverId: serverId).first(where: { $0.id == item.itemId }) {
-                    if !appState.albums.contains(where: { $0.id == album.id }) {
-                        appState.albums.append(album)
-                        appState.albums.sort { $0.name < $1.name }
-                    }
-                }
+                appState.invalidateFullAlbumCatalog()
             } else if item.itemType == "artist" {
                 if let artist = try? appState.databaseManager.loadArtists(serverId: serverId).first(where: { $0.id == item.itemId }) {
                     if !appState.artists.contains(where: { $0.id == artist.id }) {
@@ -117,6 +113,8 @@ struct HiddenItemsView: View {
                     }
                 }
             }
+
+            appState.refreshHiddenIds()
 
             // Refresh list
             loadItems()

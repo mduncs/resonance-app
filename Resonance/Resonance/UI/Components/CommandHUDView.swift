@@ -125,10 +125,13 @@ struct CommandHUDView: View {
                     isSelected: index == model.selectionIndex,
                     isPrimary: verb.isPrimary,
                     isDestructive: verb.isDestructive,
-                    isEnabled: verb.isAvailable(context)
+                    isEnabled: isVerbEnabled(verb, context: context)
                 )
                 .id(index)
-                .onTapGesture { activateRow(index) }
+                .onTapGesture {
+                    guard isVerbEnabled(verb, context: context) else { return }
+                    activateRow(index)
+                }
             }
         }
     }
@@ -187,6 +190,7 @@ struct CommandHUDView: View {
         switch model.mode {
         case .verbs:
             guard let verb = model.selectedVerb else { return }
+            guard isVerbEnabled(verb, context: makeContext()) else { return }
             if verb.id == "project" {
                 enterProjectPicker()
             } else {
@@ -197,11 +201,35 @@ struct CommandHUDView: View {
         }
     }
 
+    private func isVerbEnabled(_ verb: CurationVerb, context: CurationVerbContext) -> Bool {
+        guard verb.isAvailable(context) else { return false }
+        // Project opens a database-backed picker, so it also requires an
+        // active server (unlike its shared registry availability predicate).
+        return verb.id != "project" || appState.activeServerId != nil
+    }
+
     private func enterProjectPicker() {
-        guard let serverId = appState.activeServerId else { return }
-        let projects = (try? appState.databaseManager.loadProjects(serverId: serverId)) ?? []
-        model.enterProjectPicker(projects: projects)
-        searchFocused = true
+        guard let serverId = appState.activeServerId else {
+            appState.showFeedback(
+                message: "Connect to a server to manage projects",
+                style: .warning,
+                systemImage: "tray.full"
+            )
+            return
+        }
+
+        do {
+            let projects = try appState.databaseManager.loadProjects(serverId: serverId)
+            model.enterProjectPicker(projects: projects)
+            searchFocused = true
+        } catch {
+            appState.showFeedback(
+                message: "Couldn't load projects",
+                detail: error.localizedDescription,
+                style: .error,
+                systemImage: "tray.full"
+            )
+        }
     }
 
     private func perform(_ verb: CurationVerb) {
@@ -213,15 +241,51 @@ struct CommandHUDView: View {
         close()
         Task {
             let outcome = await verb.perform(context)
+            guard !outcome.isStale else { return }
             if let message = outcome.message {
-                appState.showFeedback(message: message, systemImage: verb.systemImage)
+                appState.showFeedback(
+                    message: message,
+                    detail: outcome.detail,
+                    style: outcome.style.appFeedbackStyle,
+                    systemImage: verb.systemImage
+                )
+            } else if Self.expectsFeedback(for: verb.id) {
+                appState.showFeedback(
+                    message: "Couldn't complete \(verb.title.lowercased())",
+                    detail: outcome.detail ?? "Please try again.",
+                    style: .error,
+                    systemImage: "exclamationmark.triangle"
+                )
             }
-            NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
+            if verb.id != "favorite" || outcome.localChangeApplied {
+                NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
+            }
         }
     }
 
+    private static func expectsFeedback(for verbID: String) -> Bool {
+        // These verbs intentionally return no toast because they open another
+        // app flow. A nil result from a write verb means the action failed.
+        !["add-to-playlist", "more-like-this", "get-info", "delete"].contains(verbID)
+    }
+
     private func performProjectRow() {
-        guard let serverId = appState.activeServerId, let song = appState.nowPlaying else { return }
+        guard let serverId = appState.activeServerId else {
+            appState.showFeedback(
+                message: "Connect to a server to manage projects",
+                style: .warning,
+                systemImage: "tray.full"
+            )
+            return
+        }
+        guard let song = appState.nowPlaying else {
+            appState.showFeedback(
+                message: "No song is available to add",
+                style: .warning,
+                systemImage: "tray.full"
+            )
+            return
+        }
         let database = appState.databaseManager
         let systemImage = CurationVerbRegistry.verb(id: "project")?.systemImage ?? "tray.full"
 
@@ -229,20 +293,30 @@ struct CommandHUDView: View {
             close()
             do {
                 try CurationVerbRegistry.addSongToProject(song, project: project, serverId: serverId, database: database)
-                appState.showFeedback(message: "Added to \(project.name)", systemImage: systemImage)
+                appState.showFeedback(message: "Added to \(project.name)", style: .success, systemImage: systemImage)
                 NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
             } catch {
-                // Silent: the toast is the only feedback surface and there is none for failure here.
+                appState.showFeedback(
+                    message: "Couldn't add to \(project.name)",
+                    detail: error.localizedDescription,
+                    style: .error,
+                    systemImage: "exclamationmark.triangle"
+                )
             }
         } else {
             // New Project from Song row.
             close()
             do {
                 let project = try CurationVerbRegistry.createListeningProject(from: song, serverId: serverId, database: database)
-                appState.showFeedback(message: "Created project \(project.name)", systemImage: systemImage)
+                appState.showFeedback(message: "Created project \(project.name)", style: .success, systemImage: systemImage)
                 NotificationCenter.default.post(name: .resonanceCurationDidChange, object: nil)
             } catch {
-                // Silent, as above.
+                appState.showFeedback(
+                    message: "Couldn't create project",
+                    detail: error.localizedDescription,
+                    style: .error,
+                    systemImage: "exclamationmark.triangle"
+                )
             }
         }
     }

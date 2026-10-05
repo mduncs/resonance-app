@@ -27,7 +27,7 @@ final class SourceAttributionTests: XCTestCase {
         XCTAssertEqual(first.sourceCollectionKey, "fetcher:source_collection:alpha")
         XCTAssertEqual(first.sourceKind, "apple_playlist")
         XCTAssertEqual(first.sourceDisplayName, "Alpha Source")
-        XCTAssertEqual(first.downloadSource, "gamdl")
+        XCTAssertEqual(first.downloadSource, "fetcher")
         XCTAssertEqual(first.queryContext, "artist track")
         XCTAssertEqual(first.acquiredAt, "2026-05-02T00:00:00.000Z")
         XCTAssertEqual(first.contractVersion, 1)
@@ -52,18 +52,18 @@ final class SourceAttributionTests: XCTestCase {
             [
               {
                 "attribution_key": "attr:v2",
-                "local_path": "/srv/fetcher/Apple/Playlists/Dance/Marsh - Stay.m4a",
+                "local_path": "/srv/fetcher/Apple/Playlists/Dance/Tidal Index - Harbor Lights.m4a",
                 "source_collection_key": "fetcher:source_collection:dance",
                 "source_kind": "apple_playlist",
                 "source_display_name": "Dance",
-                "download_source": "gamdl",
-                "query_context": "Marsh Stay",
+                "download_source": "fetcher",
+                "query_context": "Tidal Index Harbor Lights",
                 "acquired_at": "2026-07-25T18:00:00.000Z",
                 "navidrome_song_id": "f2ad13a0",
                 "resolution_method": "local_path_exact",
-                "title": "Stay",
-                "artist": "Marsh",
-                "album": "Stay - Single",
+                "title": "Harbor Lights",
+                "artist": "Tidal Index",
+                "album": "Harbor Lights - Single",
                 "duration_ms": 234567,
                 "isrc": "GBABC2600001",
                 "contract_version": 2
@@ -74,7 +74,7 @@ final class SourceAttributionTests: XCTestCase {
                 "source_collection_key": "fetcher:source_collection:dance",
                 "source_kind": "apple_playlist",
                 "source_display_name": "Dance",
-                "download_source": "gamdl",
+                "download_source": "fetcher",
                 "query_context": null,
                 "acquired_at": null,
                 "navidrome_song_id": null,
@@ -100,9 +100,9 @@ final class SourceAttributionTests: XCTestCase {
         )
         XCTAssertEqual(resolved.navidromeSongId, "f2ad13a0")
         XCTAssertEqual(resolved.resolutionMethod, "local_path_exact")
-        XCTAssertEqual(resolved.title, "Stay")
-        XCTAssertEqual(resolved.artist, "Marsh")
-        XCTAssertEqual(resolved.album, "Stay - Single")
+        XCTAssertEqual(resolved.title, "Harbor Lights")
+        XCTAssertEqual(resolved.artist, "Tidal Index")
+        XCTAssertEqual(resolved.album, "Harbor Lights - Single")
         XCTAssertEqual(resolved.durationMs, 234_567)
         XCTAssertEqual(resolved.isrc, "GBABC2600001")
         XCTAssertEqual(resolved.contractVersion, 2)
@@ -177,7 +177,7 @@ final class SourceAttributionTests: XCTestCase {
     func testUpsertV2SourceAttributionStoresNavidromeSongId() throws {
         try withTemporaryUserHome {
             let database = try DatabaseManager()
-            let path = "/srv/fetcher/Apple/Playlists/Dance/Marsh - Stay.m4a"
+            let path = "/srv/fetcher/Apple/Playlists/Dance/Tidal Index - Harbor Lights.m4a"
 
             try database.upsertSourceAttributions([
                 makeRow(
@@ -199,7 +199,7 @@ final class SourceAttributionTests: XCTestCase {
     func testUpsertV2NullNavidromeSongIdPreservesExistingId() throws {
         try withTemporaryUserHome {
             let database = try DatabaseManager()
-            let path = "/srv/fetcher/Apple/Playlists/Dance/Marsh - Stay.m4a"
+            let path = "/srv/fetcher/Apple/Playlists/Dance/Tidal Index - Harbor Lights.m4a"
 
             try database.upsertSourceAttributions([
                 makeRow(
@@ -287,10 +287,10 @@ final class SourceAttributionTests: XCTestCase {
             let database = try DatabaseManager()
             let song = Song(
                 id: "navidrome-media-file-id",
-                title: "Stay",
-                album: "Stay - Single",
+                title: "Harbor Lights",
+                album: "Harbor Lights - Single",
                 albumId: "album-1",
-                artist: "Marsh",
+                artist: "Tidal Index",
                 artistId: "artist-1",
                 track: 1,
                 discNumber: 1,
@@ -301,13 +301,13 @@ final class SourceAttributionTests: XCTestCase {
                 contentType: "audio/mp4",
                 suffix: "m4a",
                 coverArt: nil,
-                path: "Marsh/Stay - Single/01-01 - Stay.m4a"
+                path: "Tidal Index/Harbor Lights - Single/01-01 - Harbor Lights.m4a"
             )
             try database.saveSongs([song], serverId: "server-1")
             try database.upsertSourceAttributions([
                 makeRow(
                     key: "attr:v2",
-                    localPath: "/Ingest/music-fetcher/Apple/Playlists/Dance/Marsh - Stay.m4a",
+                    localPath: "/Ingest/music-fetcher/Apple/Playlists/Dance/Tidal Index - Harbor Lights.m4a",
                     displayName: "Apple Music",
                     navidromeSongId: song.id,
                     contractVersion: 2
@@ -327,6 +327,71 @@ final class SourceAttributionTests: XCTestCase {
             let batch = try database.sourceAttributionsBySongId(songs: [song])
             XCTAssertEqual(batch[song.id]?.attributionKey, "attr:v2")
             XCTAssertNotEqual(batch[song.id]?.attributionKey, "attr:path-decoy")
+        }
+    }
+
+    func testServerScopedSongAndBatchLookupsDoNotLeakCollidingSongIDs() throws {
+        try withTemporaryUserHome {
+            let database = try DatabaseManager()
+            let songA = makeSong(id: "shared-song-id", path: "Artist/A/01.flac")
+            let songB = makeSong(id: "shared-song-id", path: "Artist/B/01.flac")
+            try database.saveSongs([songA], serverId: "server-a")
+            try database.saveSongs([songB], serverId: "server-b")
+            try database.upsertFetcherAttributionFacts([
+                makeFact(
+                    key: "fact:a", path: "/fetcher/a.flac", collection: "collection:a",
+                    songId: songA.id
+                )
+            ], serverId: "server-a")
+            try database.upsertFetcherAttributionFacts([
+                makeFact(
+                    key: "fact:b", path: "/fetcher/b.flac", collection: "collection:b",
+                    songId: songB.id
+                )
+            ], serverId: "server-b")
+
+            XCTAssertEqual(
+                try database.sourceAttribution(forSongId: songA.id, serverId: "server-a")?.attributionKey,
+                "fact:a"
+            )
+            XCTAssertEqual(
+                try database.sourceAttribution(forSongId: songB.id, serverId: "server-b")?.attributionKey,
+                "fact:b"
+            )
+            XCTAssertNil(try database.sourceAttribution(forSongId: songA.id))
+
+            XCTAssertEqual(
+                try database.sourceAttributionsBySongId(songs: [songA], serverId: "server-a")[songA.id]?.attributionKey,
+                "fact:a"
+            )
+            XCTAssertEqual(
+                try database.sourceAttributionsBySongId(songs: [songB], serverId: "server-b")[songB.id]?.attributionKey,
+                "fact:b"
+            )
+            XCTAssertTrue(try database.sourceAttributionsBySongId(songs: [songA]).isEmpty)
+        }
+    }
+
+    func testServerScopedPathLookupDoesNotLeakCollidingPaths() throws {
+        try withTemporaryUserHome {
+            let database = try DatabaseManager()
+            let path = "/fetcher/shared/01.flac"
+            try database.upsertFetcherAttributionFacts([
+                makeFact(key: "fact:a", path: path, collection: "collection:a", songId: "song-a")
+            ], serverId: "server-a")
+            try database.upsertFetcherAttributionFacts([
+                makeFact(key: "fact:b", path: path, collection: "collection:b", songId: "song-b")
+            ], serverId: "server-b")
+
+            XCTAssertEqual(
+                try database.sourceAttribution(forPath: path, serverId: "server-a")?.attributionKey,
+                "fact:a"
+            )
+            XCTAssertEqual(
+                try database.sourceAttribution(forPath: path, serverId: "server-b")?.attributionKey,
+                "fact:b"
+            )
+            XCTAssertNil(try database.sourceAttribution(forPath: path))
         }
     }
 
@@ -446,11 +511,60 @@ final class SourceAttributionTests: XCTestCase {
             sourceCollectionKey: "fetcher:source_collection:alpha",
             sourceKind: "apple_playlist",
             sourceDisplayName: displayName,
-            downloadSource: "gamdl",
+            downloadSource: "fetcher",
             queryContext: "ctx",
             acquiredAt: "2026-05-02T00:00:00.000Z",
             contractVersion: contractVersion,
             navidromeSongId: navidromeSongId
+        )
+    }
+
+    private func makeFact(
+        key: String,
+        path: String,
+        collection: String,
+        songId: String
+    ) -> FetcherSourceAttribution {
+        FetcherSourceAttribution(
+            attributionKey: key,
+            localPath: path,
+            sourceCollectionKey: collection,
+            sourceKind: "apple_playlist",
+            sourceDisplayName: collection,
+            downloadSource: nil,
+            queryContext: nil,
+            acquiredAt: "2026-09-12T00:00:00Z",
+            contractVersion: 3,
+            navidromeSongId: songId,
+            resolutionMethod: "local_path_exact",
+            resolvedTracks: [
+                .init(
+                    navidromeSongId: songId,
+                    localFileRelativePath: nil,
+                    resolutionMethod: "local_path_exact"
+                )
+            ]
+        )
+    }
+
+    private func makeSong(id: String, path: String) -> Song {
+        Song(
+            id: id,
+            title: "Track \(id)",
+            album: "Album",
+            albumId: "album-\(id)",
+            artist: "Artist",
+            artistId: "artist-\(id)",
+            track: 1,
+            discNumber: 1,
+            year: 2026,
+            genre: nil,
+            duration: 180,
+            bitRate: 320,
+            contentType: "audio/flac",
+            suffix: "flac",
+            coverArt: nil,
+            path: path
         )
     }
 
@@ -499,7 +613,7 @@ final class SourceAttributionTests: XCTestCase {
                     "source_collection_key": "fetcher:source_collection:alpha",
                     "source_kind": "apple_playlist",
                     "source_display_name": "Alpha Source",
-                    "download_source": "gamdl",
+                    "download_source": "fetcher",
                     "query_context": "artist track",
                     "acquired_at": "2026-05-02T00:00:00.000Z",
                     "contract_version": 1

@@ -20,13 +20,16 @@ struct PagingRow<Item: Identifiable, Content: View>: View {
     var itemAlignment: VerticalAlignment = .center
     /// Optional row name folded into the chevron accessibility labels.
     var contextLabel: String? = nil
+    var controlStyle: ShelfPagingControlStyle = .circular
+    /// Let a card's shadow extend vertically without leaking cards sideways.
+    var shadowOverflow: CGFloat = 0
     @ViewBuilder let content: (Item) -> Content
 
     @State private var leadingID: Item.ID?
     @State private var viewportWidth: CGFloat = 0
     @State private var rowHovered = false
 
-    private let puckSize: CGFloat = 32
+    private var puckHeight: CGFloat { controlStyle == .capturedRecentlyPlayed ? 52 : 32 }
     private let puckInset: CGFloat = 6
 
     private var leadingIndex: Int {
@@ -57,7 +60,11 @@ struct PagingRow<Item: Identifiable, Content: View>: View {
             .scrollTargetLayout()
             .padding(.horizontal, 1) // Prevent clipping of card shadows
         }
-        .scrollIndicators(.hidden)
+        // Unlike .hidden, .never overrides persistent indicator policy. These
+        // captured shelves provide paging buttons as the alternative to swiping.
+        .scrollIndicators(.never, axes: .horizontal)
+        .scrollClipDisabled(shadowOverflow > 0)
+        .clipShape(ShelfViewportClip(shadowOverflow: shadowOverflow))
         .scrollPosition(id: $leadingID, anchor: .leading)
         .scrollTargetBehavior(.viewAligned)
         .background {
@@ -72,13 +79,13 @@ struct PagingRow<Item: Identifiable, Content: View>: View {
             chevron(systemImage: "chevron.left", enabled: canPageBackward, label: backwardLabel) {
                 page(by: -1)
             }
-            .offset(x: puckInset, y: chevronCenterY - puckSize / 2)
+            .offset(x: puckInset, y: chevronCenterY - puckHeight / 2)
         }
         .overlay(alignment: .topTrailing) {
             chevron(systemImage: "chevron.right", enabled: canPageForward, label: forwardLabel) {
                 page(by: 1)
             }
-            .offset(x: -puckInset, y: chevronCenterY - puckSize / 2)
+            .offset(x: -puckInset, y: chevronCenterY - puckHeight / 2)
         }
         .onHover { rowHovered = $0 }
     }
@@ -101,20 +108,7 @@ struct PagingRow<Item: Identifiable, Content: View>: View {
         let visible = rowHovered && enabled
 
         Button(action: action) {
-            Image(systemName: systemImage)
-                .font(.system(size: 13, weight: .semibold))
-                .foregroundStyle(.primary)
-                .frame(width: puckSize, height: puckSize)
-                .background(.ultraThinMaterial, in: Circle())
-                .overlay {
-                    Circle().strokeBorder(Color.white.opacity(0.2), lineWidth: 0.5)
-                }
-                .shadow(
-                    color: DesignTokens.Shadow.cardLight.color,
-                    radius: DesignTokens.Shadow.cardLight.radius,
-                    x: DesignTokens.Shadow.cardLight.x,
-                    y: DesignTokens.Shadow.cardLight.y
-                )
+            ShelfPagingButtonFace(systemImage: systemImage, style: controlStyle)
         }
         .buttonStyle(.plain)
         .accessibilityLabel(label)
@@ -135,10 +129,64 @@ struct PagingRow<Item: Identifiable, Content: View>: View {
     }
 }
 
+private struct ShelfViewportClip: Shape {
+    let shadowOverflow: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        Path(rect.insetBy(dx: 0, dy: -shadowOverflow))
+    }
+}
+
 private struct PagingRowWidthKey: PreferenceKey {
     static let defaultValue: CGFloat = 0
 
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
         value = max(value, nextValue())
+    }
+}
+
+
+/// Only the Recently Played control has this captured shape evidence. Other
+/// shelves retain their previous appearance until their states are established.
+enum ShelfPagingControlStyle {
+    case circular
+    case capturedRecentlyPlayed
+}
+
+struct ShelfPagingButtonFace: View {
+    let systemImage: String
+    let style: ShelfPagingControlStyle
+
+    private var glyph: some View {
+        // Native ColorShapeLayer is 8×29; its CGPath is not decoded yet.
+        // Preserve the existing glyph rather than claiming a guessed replacement.
+        Image(systemName: systemImage)
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.primary)
+    }
+
+    var body: some View {
+        switch style {
+        case .capturedRecentlyPlayed:
+            // Aug22 05-home Response_0/4: frame28×52, cornerRadius14,
+            // borderWidth0, shadowOpacity0. Native layered backdrop remains
+            // unresolved; ultraThinMaterial is retained, not certified equivalent.
+            glyph
+                .frame(width: 28, height: 52)
+                .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
+        case .circular:
+            glyph
+                .frame(width: 32, height: 32)
+                .background(.ultraThinMaterial, in: Circle())
+                .overlay {
+                    Circle().strokeBorder(Color.white.opacity(0.2), lineWidth: 0.5)
+                }
+                .shadow(
+                    color: DesignTokens.Shadow.cardLight.color,
+                    radius: DesignTokens.Shadow.cardLight.radius,
+                    x: DesignTokens.Shadow.cardLight.x,
+                    y: DesignTokens.Shadow.cardLight.y
+                )
+        }
     }
 }

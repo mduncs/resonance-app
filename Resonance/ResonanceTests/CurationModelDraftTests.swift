@@ -72,10 +72,13 @@ final class CurationModelDraftTests: XCTestCase {
     @MainActor
     func testCompletedOnboardingCanStartWithoutSavedServer() throws {
         try withTemporaryUserHome {
-            try withUserDefaultValues(for: ["isOnboardingComplete", "servers", "defaultViewOnLaunch"]) {
+            try withUserDefaultValues(for: [
+                "isOnboardingComplete", "servers", "defaultViewOnLaunch", "showSidebarListen"
+            ]) {
                 UserDefaults.standard.set(true, forKey: "isOnboardingComplete")
                 UserDefaults.standard.removeObject(forKey: "servers")
                 UserDefaults.standard.set(SidebarItem.listen.rawValue, forKey: "defaultViewOnLaunch")
+                UserDefaults.standard.set(true, forKey: "showSidebarListen")
 
                 let appState = AppState()
 
@@ -506,6 +509,95 @@ final class CurationModelDraftTests: XCTestCase {
         }
     }
 
+    @MainActor
+    func testPendingSeekCannotOverwriteReplacementQueueOccurrence() async throws {
+        let (playbackManager, queueManager) = try makeSeekTestManager(serverId: "seek-item-server")
+        let original = makeSong(id: "seek-original")
+        let replacement = makeSong(id: "seek-replacement")
+        XCTAssertNotNil(playbackManager.stagePausedRestore(
+            songs: [original], startingAt: 0, position: 8, serverID: "seek-item-server"
+        ))
+        playbackManager.invalidateRestoration()
+
+        let gate = TestSeekGate()
+        let pendingSeek = Task {
+            await playbackManager.seek(to: 90, performAudioSeek: { _, _, _ in
+                await gate.suspend()
+                return true
+            })
+        }
+        await gate.waitUntilStarted()
+
+        queueManager.play([replacement], startingAt: 0)
+        await gate.release()
+        await pendingSeek.value
+
+        XCTAssertEqual(queueManager.currentItem?.song.id, replacement.id)
+        XCTAssertEqual(playbackManager.currentTime, 8)
+    }
+
+    @MainActor
+    func testPendingSeekCannotOverwriteChangedServerState() async throws {
+        let (playbackManager, _) = try makeSeekTestManager(serverId: "seek-server-one")
+        XCTAssertNotNil(playbackManager.stagePausedRestore(
+            songs: [makeSong(id: "seek-server-song")], startingAt: 0,
+            position: 12, serverID: "seek-server-one"
+        ))
+        playbackManager.invalidateRestoration()
+
+        let gate = TestSeekGate()
+        let pendingSeek = Task {
+            await playbackManager.seek(to: 90, performAudioSeek: { _, _, _ in
+                await gate.suspend()
+                return true
+            })
+        }
+        await gate.waitUntilStarted()
+
+        playbackManager.activeServerId = "seek-server-two"
+        await gate.release()
+        await pendingSeek.value
+
+        XCTAssertEqual(playbackManager.currentTime, 0)
+        XCTAssertEqual(playbackManager.duration, 0)
+    }
+
+    @MainActor
+    func testNewestOverlappingSeekOwnsPublishedPosition() async throws {
+        let (playbackManager, _) = try makeSeekTestManager(serverId: "seek-overlap-server")
+        XCTAssertNotNil(playbackManager.stagePausedRestore(
+            songs: [makeSong(id: "seek-overlap-song")], startingAt: 0,
+            position: 5, serverID: "seek-overlap-server"
+        ))
+        playbackManager.invalidateRestoration()
+
+        let olderGate = TestSeekGate()
+        let olderSeek = Task {
+            await playbackManager.seek(to: 30, performAudioSeek: { _, _, _ in
+                await olderGate.suspend()
+                return true
+            })
+        }
+        await olderGate.waitUntilStarted()
+
+        let newerGate = TestSeekGate()
+        let newerSeek = Task {
+            await playbackManager.seek(to: 75, performAudioSeek: { _, _, _ in
+                await newerGate.suspend()
+                return true
+            })
+        }
+        await newerGate.waitUntilStarted()
+
+        await newerGate.release()
+        await newerSeek.value
+        XCTAssertEqual(playbackManager.currentTime, 75)
+
+        await olderGate.release()
+        await olderSeek.value
+        XCTAssertEqual(playbackManager.currentTime, 75)
+    }
+
     func testWaitingRoomDecisionRowsAreExcludedUnlessRequested() throws {
         try withTemporaryUserHome {
             let database = try DatabaseManager()
@@ -644,6 +736,24 @@ final class CurationModelDraftTests: XCTestCase {
         )
     }
 
+    @MainActor
+    private func makeSeekTestManager(serverId: String) throws -> (PlaybackManager, QueueManager) {
+        let database = try withTemporaryUserHome { try DatabaseManager() }
+        let networkActor = NetworkActor()
+        let cacheActor = CacheActor()
+        let queueManager = QueueManager()
+        let playbackManager = PlaybackManager(
+            audioActor: AudioActor(),
+            networkActor: networkActor,
+            cacheActor: cacheActor,
+            queueManager: queueManager,
+            databaseManager: database,
+            lyricsService: LyricsService(networkActor: networkActor, cacheActor: cacheActor)
+        )
+        playbackManager.activeServerId = serverId
+        return (playbackManager, queueManager)
+    }
+
     private func makeAlbum(id: String, artistId: String) -> Album {
         Album(
             id: id,
@@ -762,5 +872,35 @@ final class CurationModelDraftTests: XCTestCase {
         }
 
         return try body()
+    }
+}
+
+private actor TestSeekGate {
+    private var started = false
+    private var released = false
+    private var startedContinuation: CheckedContinuation<Void, Never>?
+    private var releaseContinuation: CheckedContinuation<Void, Never>?
+
+    func suspend() async {
+        started = true
+        startedContinuation?.resume()
+        startedContinuation = nil
+        guard !released else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            releaseContinuation = continuation
+        }
+    }
+
+    func waitUntilStarted() async {
+        guard !started else { return }
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            startedContinuation = continuation
+        }
+    }
+
+    func release() {
+        released = true
+        releaseContinuation?.resume()
+        releaseContinuation = nil
     }
 }

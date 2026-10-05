@@ -1,13 +1,110 @@
 import Foundation
 
+/// A queue section with an inexpensive advancing cursor.  Its collection
+/// indices deliberately remain zero based, so existing queue consumers retain
+/// normal `Array`-style indexing without forcing a new array after each play.
+struct QueueSection: RandomAccessCollection, MutableCollection {
+    typealias Index = Int
+    typealias Element = QueueItem
+
+    private var storage: [QueueItem]
+    private var start: Int
+    private(set) var materializationCount = 0
+
+    init(_ items: [QueueItem] = []) {
+        storage = items
+        start = 0
+    }
+
+    var startIndex: Int { 0 }
+    var endIndex: Int { storage.count - start }
+
+    subscript(position: Int) -> QueueItem {
+        get {
+            precondition(indices.contains(position), "QueueSection index out of bounds")
+            return storage[start + position]
+        }
+        set {
+            precondition(indices.contains(position), "QueueSection index out of bounds")
+            storage[start + position] = newValue
+        }
+    }
+
+    var isEmpty: Bool { start == storage.count }
+
+    mutating func advance() -> QueueItem? {
+        guard !isEmpty else { return nil }
+        defer { start += 1 }
+        return storage[start]
+    }
+
+    mutating func append(_ item: QueueItem) {
+        compactIfNeeded()
+        storage.append(item)
+    }
+
+    mutating func append(contentsOf items: [QueueItem]) {
+        compactIfNeeded()
+        storage.append(contentsOf: items)
+    }
+
+    mutating func prepend(_ item: QueueItem) {
+        compactIfNeeded()
+        storage.insert(item, at: start)
+    }
+
+    mutating func remove(at index: Int) {
+        precondition(indices.contains(index), "QueueSection index out of bounds")
+        storage.remove(at: start + index)
+    }
+
+    mutating func removeFirst(_ count: Int) {
+        precondition((0...self.count).contains(count), "QueueSection removal out of bounds")
+        start += count
+    }
+
+    mutating func remove(atOffsets offsets: IndexSet) {
+        precondition(offsets.allSatisfy(indices.contains), "QueueSection removal out of bounds")
+        for index in offsets.sorted(by: >) {
+            storage.remove(at: start + index)
+        }
+    }
+
+    mutating func move(fromOffsets source: IndexSet, toOffset destination: Int) {
+        precondition(source.allSatisfy(indices.contains), "QueueSection move source out of bounds")
+        precondition((0...count).contains(destination), "QueueSection move destination out of bounds")
+        let moving = source.sorted().map { storage[start + $0] }
+        remove(atOffsets: source)
+        let removedBeforeDestination = source.filter { $0 < destination }.count
+        storage.insert(contentsOf: moving, at: start + destination - removedBeforeDestination)
+    }
+
+    private mutating func compactIfNeeded() {
+        // Retain the shared buffer while navigation is in progress.  Reclaim a
+        // substantially consumed prefix only before a structural mutation.
+        guard start > 0 else { return }
+        storage = Array(storage[start...])
+        start = 0
+        materializationCount += 1
+    }
+}
+
+struct QueueScalabilityProbe {
+    fileprivate(set) var snapshotsCreated = 0
+    /// Sum of history-prefix lengths recorded by actual snapshots.
+    fileprivate(set) var historyPrefixCountTotal = 0
+    /// Copies made to compact a cursor-backed section before structural edits.
+    fileprivate(set) var sectionMaterializations = 0
+}
+
 @MainActor
 @Observable
 final class QueueManager {
     private struct QueueStateSnapshot {
         let baseItems: [QueueItem]
-        let upNextItems: [QueueItem]
-        let autoPlayItems: [QueueItem]
-        let history: [QueueItem]
+        let upNextItems: QueueSection
+        let autoPlayItems: QueueSection
+        let historyCount: Int
         let currentItem: QueueItem?
         let basePosition: Int
         let isShuffleEnabled: Bool
@@ -20,10 +117,10 @@ final class QueueManager {
     private(set) var baseItems: [QueueItem] = []
 
     /// User-inserted "Play Next" / "Add to Queue" items (consumed FIFO when played)
-    private(set) var upNextItems: [QueueItem] = []
+    private(set) var upNextItems = QueueSection()
 
     /// Similar songs fetched when queue exhausts (autoplay)
-    private(set) var autoPlayItems: [QueueItem] = []
+    private(set) var autoPlayItems = QueueSection()
 
     /// Previously played items
     private(set) var history: [QueueItem] = []
@@ -45,6 +142,17 @@ final class QueueManager {
     /// Queue state for a history item at the moment it was current.
     private var historySnapshots: [UUID: QueueStateSnapshot] = [:]
 
+    private var snapshotsCreated = 0
+    private var historyPrefixCountTotal = 0
+
+    var scalabilityProbe: QueueScalabilityProbe {
+        QueueScalabilityProbe(
+            snapshotsCreated: snapshotsCreated,
+            historyPrefixCountTotal: historyPrefixCountTotal,
+            sectionMaterializations: upNextItems.materializationCount + autoPlayItems.materializationCount
+        )
+    }
+
     // MARK: - Computed Properties
 
     var isEmpty: Bool {
@@ -56,6 +164,18 @@ final class QueueManager {
         !upNextItems.isEmpty
             || basePosition + 1 < baseItems.count
             || !autoPlayItems.isEmpty
+    }
+
+    /// History takes precedence; a fresh middle-of-album start can also move
+    /// backward within its base order. Match the occurrence, not the song ID.
+    var hasPrevious: Bool {
+        !history.isEmpty || canStepToPreviousBaseItem
+    }
+
+    private var canStepToPreviousBaseItem: Bool {
+        basePosition > 0
+            && baseItems.indices.contains(basePosition)
+            && currentItem?.id == baseItems[basePosition].id
     }
 
     /// Total count of all items including current (for backward compat)
@@ -73,7 +193,7 @@ final class QueueManager {
 
     /// Everything upcoming in playback order: upNext first, then remaining base, then autoplay
     var allUpcoming: [QueueItem] {
-        upNextItems + remainingBaseItems + autoPlayItems
+        Array(upNextItems) + remainingBaseItems + Array(autoPlayItems)
     }
 
     var remainingBaseCount: Int {
@@ -122,14 +242,71 @@ final class QueueManager {
     func play(_ songs: [Song], startingAt index: Int = 0) {
         guard !songs.isEmpty else { return }
         baseItems = songs.map { QueueItem(song: $0) }
-        basePosition = min(index, baseItems.count - 1)
+        basePosition = max(0, min(index, baseItems.count - 1))
         currentItem = baseItems[basePosition]
-        upNextItems = []
-        autoPlayItems = []
+        upNextItems = QueueSection()
+        autoPlayItems = QueueSection()
         history = []
         isShuffleEnabled = false
         originalBaseOrder = []
         historySnapshots = [:]
+        snapshotsCreated = 0
+        historyPrefixCountTotal = 0
+        needsPlaybackStart = false
+    }
+
+    /// Installs a fully sectioned queue for the launch-only parity atlas.
+    /// Callers provide stable item identifiers and timestamps so queue/history
+    /// screenshots do not depend on UUID generation or live playback. This
+    /// mutates only this in-memory manager and never invokes PlaybackManager.
+    func installDeterministicFixture(
+        baseItems: [QueueItem],
+        currentIndex: Int,
+        upNextItems: [QueueItem],
+        autoPlayItems: [QueueItem],
+        history: [QueueItem]
+    ) {
+        guard baseItems.indices.contains(currentIndex) else { return }
+
+        self.baseItems = baseItems
+        self.basePosition = currentIndex
+        self.currentItem = baseItems[currentIndex]
+        self.upNextItems = QueueSection(upNextItems)
+        self.autoPlayItems = QueueSection(autoPlayItems)
+        self.history = history
+        self.isShuffleEnabled = false
+        self.originalBaseOrder = []
+        self.historySnapshots = [:]
+        self.snapshotsCreated = 0
+        self.historyPrefixCountTotal = 0
+        self.needsPlaybackStart = false
+    }
+
+    /// Installs the launch-only parity queue-empty state.
+    ///
+    /// This is deliberately separate from `clear()`: the production clear
+    /// command keeps the current song, while the atlas empty route must make
+    /// `QueueView` observe no current, base, up-next, autoplay, or history
+    /// items. It only changes this in-memory queue state and is never called
+    /// by normal playback flows.
+    func installDeterministicEmptyFixture() {
+        resetForServerChange()
+    }
+
+    /// Drop every occurrence when leaving its server; unlike Clear Upcoming,
+    /// no current item, base prefix, or historical occurrence survives.
+    func resetForServerChange() {
+        baseItems = []
+        upNextItems = QueueSection()
+        autoPlayItems = QueueSection()
+        history = []
+        currentItem = nil
+        basePosition = -1
+        isShuffleEnabled = false
+        originalBaseOrder = []
+        historySnapshots = [:]
+        snapshotsCreated = 0
+        historyPrefixCountTotal = 0
         needsPlaybackStart = false
     }
 
@@ -139,7 +316,7 @@ final class QueueManager {
             currentItem = item
             needsPlaybackStart = true
         } else {
-            upNextItems.insert(item, at: 0)
+            upNextItems.prepend(item)
         }
     }
 
@@ -160,7 +337,7 @@ final class QueueManager {
 
         // 1. Check upNext (consumed FIFO)
         if !upNextItems.isEmpty {
-            currentItem = upNextItems.removeFirst()
+            currentItem = upNextItems.advance()
             return currentItem
         }
 
@@ -173,7 +350,7 @@ final class QueueManager {
 
         // 3. Check autoplay items
         if !autoPlayItems.isEmpty {
-            currentItem = autoPlayItems.removeFirst()
+            currentItem = autoPlayItems.advance()
             return currentItem
         }
 
@@ -192,8 +369,15 @@ final class QueueManager {
     }
 
     func previous() -> QueueItem? {
-        guard let lastPlayed = history.last else { return nil }
-        return restoreHistoryItem(id: lastPlayed.id)
+        if let lastPlayed = history.last {
+            return restoreHistoryItem(id: lastPlayed.id)
+        }
+        guard canStepToPreviousBaseItem else { return nil }
+        // Starting in the middle does not make the earlier tracks played
+        // history. Leave manual and autoplay sections intact while stepping back.
+        basePosition -= 1
+        currentItem = baseItems[basePosition]
+        return currentItem
     }
 
     /// Skip to a specific item by ID. Searches all sections.
@@ -206,7 +390,7 @@ final class QueueManager {
         if let idx = upNextItems.firstIndex(where: { $0.id == id }) {
             prepareSkippedUpNextHistory(targetIndex: idx)
             currentItem = upNextItems[idx]
-            upNextItems.removeSubrange(0...idx)
+            upNextItems.removeFirst(idx + 1)
             return currentItem
         }
 
@@ -222,7 +406,7 @@ final class QueueManager {
         if let idx = autoPlayItems.firstIndex(where: { $0.id == id }) {
             prepareSkippedAutoPlayHistory(targetIndex: idx)
             currentItem = autoPlayItems[idx]
-            autoPlayItems.removeSubrange(0...idx)
+            autoPlayItems.removeFirst(idx + 1)
             return currentItem
         }
 
@@ -279,10 +463,26 @@ final class QueueManager {
         upNextItems.move(fromOffsets: source, toOffset: destination)
     }
 
+    /// Reorder manual queue occurrences by their current stable IDs, not drag-start indices.
+    /// Dropping downward places the source after the target; upward places it before.
+    @discardableResult
+    func moveUpNextItem(id: UUID, onto targetID: UUID) -> Bool {
+        guard let source = upNextItems.firstIndex(where: { $0.id == id }),
+              let target = upNextItems.firstIndex(where: { $0.id == targetID }) else {
+            return false
+        }
+        guard source != target else { return true }
+        moveUpNext(
+            from: IndexSet(integer: source),
+            to: target > source ? target + 1 : target
+        )
+        return true
+    }
+
     /// Clear all upcoming items, keeping only the current song playing
     func clear() {
-        upNextItems = []
-        autoPlayItems = []
+        upNextItems = QueueSection()
+        autoPlayItems = QueueSection()
         // Trim base items to only include up to current position
         if basePosition >= 0 && basePosition < baseItems.count {
             baseItems = Array(baseItems.prefix(basePosition + 1))
@@ -311,7 +511,7 @@ final class QueueManager {
         // Filter out songs already in queue or history
         let existingIds = allSongIds
         let filtered = songs.filter { !existingIds.contains($0.id) }
-        autoPlayItems = filtered.map { QueueItem(song: $0) }
+        autoPlayItems = QueueSection(filtered.map { QueueItem(song: $0) })
     }
 
     // MARK: - Shuffle
@@ -342,24 +542,27 @@ final class QueueManager {
         guard items.count > 2 else { return items.shuffled() }
 
         var result: [QueueItem] = []
-        var remaining = items.shuffled()
-        var lastArtist: String? = nil
-        let maxAttempts = items.count * 3
-        var attempts = 0
-
-        while !remaining.isEmpty && attempts < maxAttempts {
-            if let index = remaining.firstIndex(where: { $0.song.artist != lastArtist }) {
-                let song = remaining.remove(at: index)
-                result.append(song)
-                lastArtist = song.song.artist
-            } else {
-                result.append(remaining.removeFirst())
-                lastArtist = result.last?.song.artist
-            }
-            attempts += 1
+        var buckets: [String: [QueueItem]] = [:]
+        for item in items.shuffled() {
+            buckets[item.song.artist, default: []].append(item)
         }
+        var activeArtists = Array(buckets.keys).shuffled()
+        var lastArtist: String?
 
-        result.append(contentsOf: remaining)
+        while !activeArtists.isEmpty {
+            var index = Int.random(in: activeArtists.indices)
+            if activeArtists.count > 1, activeArtists[index] == lastArtist {
+                index = (index + Int.random(in: 1..<activeArtists.count)) % activeArtists.count
+            }
+            let artist = activeArtists[index]
+            let song = buckets[artist]!.removeLast()
+            result.append(song)
+            lastArtist = artist
+            if buckets[artist]!.isEmpty {
+                activeArtists.swapAt(index, activeArtists.count - 1)
+                activeArtists.removeLast()
+            }
+        }
         return result
     }
 
@@ -429,11 +632,13 @@ final class QueueManager {
         let originalUpNext = upNextItems
         for idx in 0..<targetIndex {
             let skippedItem = originalUpNext[idx]
+            var remainingUpNext = originalUpNext
+            remainingUpNext.removeFirst(idx + 1)
             historySnapshots[skippedItem.id] = QueueStateSnapshot(
                 baseItems: baseItems,
-                upNextItems: Array(originalUpNext[(idx + 1)...]),
+                upNextItems: remainingUpNext,
                 autoPlayItems: autoPlayItems,
-                history: simulatedHistory,
+                historyCount: simulatedHistory.count,
                 currentItem: skippedItem,
                 basePosition: basePosition,
                 isShuffleEnabled: isShuffleEnabled,
@@ -457,7 +662,7 @@ final class QueueManager {
                 baseItems: baseItems,
                 upNextItems: upNextItems,
                 autoPlayItems: autoPlayItems,
-                history: simulatedHistory,
+                historyCount: simulatedHistory.count,
                 currentItem: skippedItem,
                 basePosition: idx,
                 isShuffleEnabled: isShuffleEnabled,
@@ -478,11 +683,13 @@ final class QueueManager {
         let originalAutoPlay = autoPlayItems
         for idx in 0..<targetIndex {
             let skippedItem = originalAutoPlay[idx]
+            var remainingAutoPlay = originalAutoPlay
+            remainingAutoPlay.removeFirst(idx + 1)
             historySnapshots[skippedItem.id] = QueueStateSnapshot(
                 baseItems: baseItems,
                 upNextItems: upNextItems,
-                autoPlayItems: Array(originalAutoPlay[(idx + 1)...]),
-                history: simulatedHistory,
+                autoPlayItems: remainingAutoPlay,
+                historyCount: simulatedHistory.count,
                 currentItem: skippedItem,
                 basePosition: basePosition,
                 isShuffleEnabled: isShuffleEnabled,
@@ -502,17 +709,19 @@ final class QueueManager {
         let originalBaseById = Dictionary(uniqueKeysWithValues: originalBaseOrder.map { ($0.id, $0) })
 
         var playedBaseIds: [UUID] = []
+        var playedBaseSet = Set<UUID>()
         for item in history where originalBaseIds.contains(item.id) {
-            if !playedBaseIds.contains(item.id) {
+            if playedBaseSet.insert(item.id).inserted {
                 playedBaseIds.append(item.id)
             }
         }
 
-        if let current = currentItem, originalBaseIds.contains(current.id), !playedBaseIds.contains(current.id) {
+        if let current = currentItem,
+           originalBaseIds.contains(current.id),
+           playedBaseSet.insert(current.id).inserted {
             playedBaseIds.append(current.id)
         }
 
-        let playedBaseSet = Set(playedBaseIds)
         let unplayedOriginalIds = originalBaseOrder.map(\.id).filter { !playedBaseSet.contains($0) }
         let rebuiltIds = playedBaseIds + unplayedOriginalIds
 
@@ -534,11 +743,13 @@ final class QueueManager {
     }
 
     private func snapshot() -> QueueStateSnapshot {
-        QueueStateSnapshot(
+        snapshotsCreated += 1
+        historyPrefixCountTotal += history.count
+        return QueueStateSnapshot(
             baseItems: baseItems,
             upNextItems: upNextItems,
             autoPlayItems: autoPlayItems,
-            history: history,
+            historyCount: history.count,
             currentItem: currentItem,
             basePosition: basePosition,
             isShuffleEnabled: isShuffleEnabled,
@@ -550,7 +761,7 @@ final class QueueManager {
         baseItems = snapshot.baseItems
         upNextItems = snapshot.upNextItems
         autoPlayItems = snapshot.autoPlayItems
-        history = snapshot.history
+        history = Array(history.prefix(snapshot.historyCount))
         currentItem = snapshot.currentItem
         basePosition = snapshot.basePosition
         isShuffleEnabled = snapshot.isShuffleEnabled
@@ -570,8 +781,8 @@ final class QueueManager {
 
         currentItem = selectedItem
         history = earlierHistory
-        upNextItems = futureItems
-        autoPlayItems = []
+        upNextItems = QueueSection(futureItems)
+        autoPlayItems = QueueSection()
 
         if let selectedBaseIndex = baseItems.firstIndex(where: { $0.id == id }) {
             baseItems = Array(baseItems.prefix(selectedBaseIndex + 1))

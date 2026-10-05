@@ -2,14 +2,33 @@ import AVFoundation
 import Combine
 
 actor AudioActor {
+    private var loadGeneration: UInt64 = 0
+    private var currentRestorationID: UUID?
+    /// Ownership is eligible for seeking only while its item is the active player.
+    /// A crossfade records the incoming restoration owner before the player swap,
+    /// so this remains nil during that transition.
+    private var activeSeekOwnershipID: UUID?
+    private var latestSeekRequestGeneration: UInt64 = 0
+    // Cancellation can arrive while URL resolution precedes actor registration.
+    private var cancelledOwnershipIDs = Set<UUID>()
     private var player: AVPlayer?
     private var playerItem: AVPlayerItem?
+    /// Runtime evidence for the parity fixture's no-live-playback contract.
+    /// This increments at the two points where Resonance creates an
+    /// `AVPlayerItem`; a settled fixture launch must report zero.
+    private var playerItemCreationCount = 0
+
+    /// Read-only capture audit. Normal playback behavior is unchanged.
+    func auditPlayerItemCreationCount() -> Int {
+        playerItemCreationCount
+    }
     private var timeObserver: Any?
 
     // Crossfade support
     private var crossfadePlayer: AVPlayer?
     private var crossfadeDuration: TimeInterval = 0
     private var isCrossfading = false
+    private var crossfadePreparedDuration: TimeInterval?
     private var crossfadeTask: Task<Void, Never>?
 
     private var isPlaying = false
@@ -27,43 +46,99 @@ actor AudioActor {
 
     // MARK: - Public API
 
-    func play(url: URL) async throws {
-        // Stop and clean up old player completely
+    func play(url: URL, initialPosition: TimeInterval = 0, restorationID: UUID? = nil) async throws {
+        try Task.checkCancellation()
+        if let restorationID, cancelledOwnershipIDs.contains(restorationID) { throw CancellationError() }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        currentRestorationID = restorationID
+        activeSeekOwnershipID = nil
+        latestSeekRequestGeneration = 0
+        stopCrossfade()
         removeObservers()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
         player = nil
+        playerItem = nil
+        isPlaying = false
 
         let asset = AVURLAsset(url: url)
+        playerItemCreationCount += 1
         let item = AVPlayerItem(asset: asset)
+        let durationCMTime = try? await asset.load(.duration)
+        try Task.checkCancellation()
+        guard generation == loadGeneration else { throw CancellationError() }
+        let loadedDuration = durationCMTime.map(CMTimeGetSeconds) ?? 0
+        let safeDuration = loadedDuration.isFinite ? max(0, loadedDuration) : 0
+        let candidate = AVPlayer(playerItem: item)
+        candidate.allowsExternalPlayback = true
+        let position = initialPosition.isFinite ? max(0, min(initialPosition, safeDuration)) : 0
+        if position > 0 {
+            await candidate.seek(to: CMTime(seconds: position, preferredTimescale: 600),
+                                 toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        // Cancellation cleanup is candidate-local; never pause/clear a newer player.
+        guard !Task.isCancelled, generation == loadGeneration else {
+            candidate.pause()
+            candidate.replaceCurrentItem(with: nil)
+            throw CancellationError()
+        }
         playerItem = item
-
-        if let durationCMTime = try? await asset.load(.duration) {
-            let loadedDuration = CMTimeGetSeconds(durationCMTime)
-            duration = loadedDuration.isFinite ? max(0, loadedDuration) : 0
-        } else {
-            duration = 0
-        }
-
+        player = candidate
+        duration = safeDuration
+        activeSeekOwnershipID = restorationID
+        let itemIdentity = ObjectIdentifier(item)
         finishedObserver = NotificationCenter.default.addObserver(
-            forName: .AVPlayerItemDidPlayToEndTime,
-            object: item,
-            queue: .main
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main
         ) { [weak self] _ in
-            Task { await self?.handleTrackFinished() }
+            Task { await self?.handleTrackFinished(itemIdentity: itemIdentity) }
         }
-
-        // Create a fresh player for each song to avoid state carryover
-        player = AVPlayer(playerItem: item)
-        player?.allowsExternalPlayback = true
         applyVolume()
-        player?.play()
+        candidate.play()
         isPlaying = true
-
         startTimeTracking()
     }
 
+    /// An old cancellation must never pause a replacement player.
+    func cancelRestoration(id: UUID) {
+        cancelledOwnershipIDs.insert(id)
+        guard currentRestorationID == id else { return }
+        loadGeneration &+= 1
+        currentRestorationID = nil
+        activeSeekOwnershipID = nil
+        latestSeekRequestGeneration = 0
+        stopCrossfade()
+        removeObservers()
+        player?.pause()
+        player?.replaceCurrentItem(with: nil)
+        player = nil
+        playerItem = nil
+        isPlaying = false
+    }
+
     func pause() {
+        loadGeneration &+= 1
+        if isCrossfading {
+            crossfadeTask?.cancel()
+            crossfadeTask = nil
+            if crossfadePlayer?.currentItem != nil, let incomingDuration = crossfadePreparedDuration {
+                // Queue/PlaybackManager already name the incoming track. Promote it
+                // paused; never resume the outgoing track under the incoming title.
+                crossfadePlayer?.pause()
+                completeCrossfade(newDuration: incomingDuration)
+            } else {
+                // Incoming preparation has not produced an item. Drop the outgoing
+                // item so resume's noFileLoaded path resolves the actual queued song.
+                stopCrossfade()
+                removeObservers()
+                player?.pause()
+                player?.replaceCurrentItem(with: nil)
+                player = nil
+                playerItem = nil
+                activeSeekOwnershipID = nil
+                latestSeekRequestGeneration = 0
+            }
+        }
         player?.pause()
         isPlaying = false
     }
@@ -82,6 +157,11 @@ actor AudioActor {
     }
 
     func stop() {
+        currentRestorationID = nil
+        activeSeekOwnershipID = nil
+        latestSeekRequestGeneration = 0
+        loadGeneration &+= 1
+        stopCrossfade()
         removeObservers()
         player?.pause()
         player?.replaceCurrentItem(with: nil)
@@ -89,10 +169,32 @@ actor AudioActor {
         isPlaying = false
     }
 
-    func seek(to time: TimeInterval) async {
-        let clampedTime = max(0, min(time, duration))
+    /// A seek carries both the manager's playback owner and monotonic request
+    /// generation. Validate before touching AVPlayer so delayed actor messages
+    /// cannot seek a replacement item or let an older overlapping request win.
+    func seek(to time: TimeInterval, expecting ownershipID: UUID?, requestGeneration: UInt64) async -> Bool {
+        guard let ownershipID,
+              activeSeekOwnershipID == ownershipID,
+              requestGeneration > latestSeekRequestGeneration,
+              let expectedPlayer = player,
+              let expectedItem = playerItem else { return false }
+
+        latestSeekRequestGeneration = requestGeneration
+        let clampedTime = time.isFinite ? max(0, min(time, duration)) : 0
         let cmTime = CMTime(seconds: clampedTime, preferredTimescale: 600)
-        await player?.seek(to: cmTime)
+        let finished = await expectedPlayer.seek(
+            to: cmTime,
+            toleranceBefore: .positiveInfinity,
+            toleranceAfter: .positiveInfinity
+        )
+        guard finished else { return false }
+
+        // AVPlayer seek is async and the actor is reentrant while it runs.
+        // Report completion only while the same item/request still owns playback.
+        return activeSeekOwnershipID == ownershipID
+            && latestSeekRequestGeneration == requestGeneration
+            && player === expectedPlayer
+            && playerItem === expectedItem
     }
 
     func setVolume(_ vol: Float) {
@@ -173,15 +275,6 @@ actor AudioActor {
         isPlaying
     }
 
-    // MARK: - EQ (stub - not supported with AVPlayer)
-    // AVPlayer does not expose the DSP pipeline needed to implement these controls.
-
-    func setEQEnabled(_ enabled: Bool) {}
-    func setEQBand(_ index: Int, gain: Float) {}
-    func setEQPreset(_ gains: [Float]) {}
-    func setEQBands(_ gains: [Float]) {}
-    func getEQBands() -> [Float] { Array(repeating: 0, count: 10) }
-
     // MARK: - Crossfade
 
     func setCrossfadeDuration(_ newDuration: TimeInterval) {
@@ -193,14 +286,22 @@ actor AudioActor {
     }
 
     /// Crossfade to a new track with volume interpolation
-    func crossfadeTo(url: URL) async throws {
+    func crossfadeTo(url: URL, ownershipID: UUID? = nil) async throws {
+        try Task.checkCancellation()
+        if let ownershipID, cancelledOwnershipIDs.contains(ownershipID) { throw CancellationError() }
+        loadGeneration &+= 1
+        let generation = loadGeneration
+        currentRestorationID = ownershipID
+        activeSeekOwnershipID = nil
+        latestSeekRequestGeneration = 0
         // If crossfade is disabled or no current track, just play normally
         guard crossfadeDuration > 0, isPlaying, player != nil else {
-            try await play(url: url)
+            try await play(url: url, restorationID: ownershipID)
             return
         }
 
         isCrossfading = true
+        crossfadePreparedDuration = nil
 
         // Cancel any existing crossfade
         crossfadeTask?.cancel()
@@ -208,38 +309,46 @@ actor AudioActor {
         // Create new player for incoming track
         crossfadePlayer = AVPlayer()
         let asset = AVURLAsset(url: url)
+        playerItemCreationCount += 1
         let item = AVPlayerItem(asset: asset)
 
         let newDuration = try await asset.load(.duration)
-        let newDurationSeconds = CMTimeGetSeconds(newDuration)
+        try Task.checkCancellation()
+        guard generation == loadGeneration else { throw CancellationError() }
+        let rawDuration = CMTimeGetSeconds(newDuration)
+        let newDurationSeconds = rawDuration.isFinite ? max(0, rawDuration) : 0
+        crossfadePreparedDuration = newDurationSeconds
 
         crossfadePlayer?.replaceCurrentItem(with: item)
         crossfadePlayer?.volume = 0  // Start silent
 
         // Register end-of-track observer IMMEDIATELY so we don't miss the notification
+        let incomingIdentity = ObjectIdentifier(item)
         crossfadeFinishedObserver = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
         ) { [weak self] _ in
-            Task { await self?.handleTrackFinished() }
+            Task { await self?.handleTrackFinished(itemIdentity: incomingIdentity) }
         }
 
         // Start playing the new track
         crossfadePlayer?.play()
 
         // Animate the crossfade over the duration
-        let steps = Int(crossfadeDuration * 20)  // 20 steps per second
+        let steps = max(1, Int(crossfadeDuration * 20))  // 20 steps per second
         let stepDuration = crossfadeDuration / Double(steps)
 
         crossfadeTask = Task {
-            await performCrossfadeAnimation(steps: steps, stepDuration: stepDuration, newDuration: newDurationSeconds)
+            await performCrossfadeAnimation(steps: steps, stepDuration: stepDuration,
+                                            newDuration: newDurationSeconds, generation: generation)
         }
     }
 
-    private func performCrossfadeAnimation(steps: Int, stepDuration: Double, newDuration: TimeInterval) async {
+    private func performCrossfadeAnimation(steps: Int, stepDuration: Double, newDuration: TimeInterval,
+                                           generation: UInt64) async {
         for i in 0...steps {
-            guard !Task.isCancelled else { break }
+            guard !Task.isCancelled, generation == loadGeneration else { return }
 
             let progress = Float(i) / Float(steps)
 
@@ -253,8 +362,23 @@ actor AudioActor {
             try? await Task.sleep(for: .seconds(stepDuration))
         }
 
-        // Crossfade complete - swap players
+        // Never swap or clear players after a newer owner has taken over.
+        guard !Task.isCancelled, generation == loadGeneration else { return }
         completeCrossfade(newDuration: newDuration)
+    }
+
+    private func stopCrossfade() {
+        crossfadeTask?.cancel()
+        crossfadeTask = nil
+        crossfadePlayer?.pause()
+        crossfadePlayer?.replaceCurrentItem(with: nil)
+        crossfadePlayer = nil
+        crossfadePreparedDuration = nil
+        isCrossfading = false
+        if let crossfadeFinishedObserver {
+            NotificationCenter.default.removeObserver(crossfadeFinishedObserver)
+            self.crossfadeFinishedObserver = nil
+        }
     }
 
     private func completeCrossfade(newDuration: TimeInterval) {
@@ -271,7 +395,10 @@ actor AudioActor {
         player = crossfadePlayer
         crossfadePlayer = nil
         playerItem = player?.currentItem
+        activeSeekOwnershipID = currentRestorationID
+        latestSeekRequestGeneration = 0
         duration = newDuration
+        crossfadePreparedDuration = nil
 
         // Set the saved observer as the main finished observer
         finishedObserver = newTrackObserver
@@ -294,16 +421,23 @@ actor AudioActor {
     // MARK: - Private
 
     private func startTimeTracking() {
+        if let timeObserver {
+            player?.removeTimeObserver(timeObserver)
+            self.timeObserver = nil
+        }
+        guard let playerItem else { return }
+        let itemIdentity = ObjectIdentifier(playerItem)
         let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
         timeObserver = player?.addPeriodicTimeObserver(forInterval: interval, queue: .main) { [weak self] time in
             let seconds = CMTimeGetSeconds(time)
             if seconds.isFinite {
-                Task { await self?.notifyTimeUpdate(seconds) }
+                Task { await self?.notifyTimeUpdate(seconds, itemIdentity: itemIdentity) }
             }
         }
     }
 
-    private func notifyTimeUpdate(_ time: TimeInterval) {
+    private func notifyTimeUpdate(_ time: TimeInterval, itemIdentity: ObjectIdentifier) {
+        guard playerItem.map(ObjectIdentifier.init) == itemIdentity else { return }
         onTimeUpdate?(time)
     }
 
@@ -322,7 +456,9 @@ actor AudioActor {
         }
     }
 
-    private func handleTrackFinished() {
+    private func handleTrackFinished(itemIdentity: ObjectIdentifier? = nil) {
+        if let itemIdentity, playerItem.map(ObjectIdentifier.init) != itemIdentity,
+           crossfadePlayer?.currentItem.map(ObjectIdentifier.init) != itemIdentity { return }
         isPlaying = false
         onTrackFinished?()
     }

@@ -3,12 +3,14 @@ import SwiftUI
 // MARK: - Layout Options
 
 enum ArtistLayoutStyle: String, CaseIterable {
+    case browser = "Browser"
     case list = "List"
     case grid = "Grid"
     case compact = "Compact"
 
     var icon: String {
         switch self {
+        case .browser: return "sidebar.left"
         case .list: return "list.bullet"
         case .grid: return "square.grid.2x2"
         case .compact: return "rectangle.grid.1x2"
@@ -20,7 +22,8 @@ struct ArtistsView: View {
     @Environment(AppState.self) private var appState
     @State private var viewState: ViewState = .loading
     @State private var searchText = ""
-    @AppStorage("artistLayoutStyle") private var layoutStyle: ArtistLayoutStyle = .grid
+    @State private var loadGeneration = UUID()
+    @AppStorage("artistLayoutStyle") private var layoutStyle: ArtistLayoutStyle = .browser
     @AppStorage("minArtistAlbumCount") private var minArtistAlbumCount = 1
 
     enum ViewState {
@@ -51,29 +54,6 @@ struct ArtistsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Apple Music-style page header
-            HStack(alignment: .center) {
-                Text("Artists")
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
-
-                Spacer()
-
-                // Layout picker as segmented control
-                Picker("Layout", selection: $layoutStyle) {
-                    ForEach(ArtistLayoutStyle.allCases, id: \.self) { style in
-                        Image(systemName: style.icon)
-                            .tag(style)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .fixedSize()
-                .help("Change layout style")
-            }
-            .padding(.horizontal, 24)
-            .padding(.top, 24)
-            .padding(.bottom, 16)
-
             // Content
             Group {
                 switch viewState {
@@ -128,6 +108,8 @@ struct ArtistsView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     } else {
                         switch layoutStyle {
+                        case .browser:
+                            ArtistBrowserView(artists: filteredArtists)
                         case .list:
                             ArtistListView(groupedArtists: groupedArtists)
                         case .grid:
@@ -140,44 +122,128 @@ struct ArtistsView: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .navigationTitle("")
-        .searchable(text: $searchText, prompt: "Search artists")
-        .task {
+        .navigationTitle("Artists")
+        .searchable(text: $searchText, prompt: "Find in Artists")
+        .toolbar {
+            // Native Aug22 Artists puts its title and Find above the rail,
+            // not in an additional large in-content header. Exact title/search
+            // metrics are not exposed by that capture's hierarchy.
+            if #available(macOS 26.0, *) {
+                ToolbarItem(placement: .navigation) { Text("Artists") }
+                    .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItem(placement: .navigation) { Text("Artists") }
+            }
+            ToolbarItem(placement: .principal) { Spacer() }
+            ToolbarItem(placement: .primaryAction) {
+                // Preserve Resonance's saved layouts without presenting them
+                // as a reconstruction of Music's captured filter control.
+                Menu {
+                    Picker("Layout", selection: $layoutStyle) {
+                        ForEach(ArtistLayoutStyle.allCases, id: \.self) { style in
+                            Label(style.rawValue, systemImage: style.icon)
+                                .tag(style)
+                        }
+                    }
+                } label: {
+                    Label("Layout", systemImage: layoutStyle.icon)
+                }
+                .help("Change artist layout")
+                .accessibilityIdentifier("Artists.Layout")
+                .accessibilityLabel("Artist layout")
+                .accessibilityValue(layoutStyle.rawValue)
+            }
+        }
+        .task(id: appState.activeServerId) {
             await loadArtists()
+        }
+        .onDisappear {
+            loadGeneration = UUID()
         }
     }
 
     private func loadArtists() async {
-        // 1. Load from GRDB cache immediately (if available)
-        if let serverId = appState.activeServerId,
-           let cached = try? appState.databaseManager.loadAdmittedArtists(serverId: serverId),
-           !cached.isEmpty {
-            appState.artists = cached
-            viewState = cached.isEmpty ? .empty : .populated
-        } else {
-            viewState = .loading
+        let generation = UUID()
+        loadGeneration = generation
+        guard let serverId = appState.activeServerId,
+              let serverUUID = UUID(uuidString: serverId) else {
+            appState.artists = []
+            viewState = .empty
+            return
         }
 
-        // 2. Background sync from server
-        do {
-            let artists = try await appState.networkActor.fetchArtists()
-            appState.artists = artists
-            viewState = artists.isEmpty ? .empty : .populated
+        // Publish only admitted cached artists from this server, including an
+        // empty result; never leave the previous server's collection visible.
+        let cached = (try? appState.databaseManager.loadAdmittedArtists(serverId: serverId)) ?? []
+        appState.artists = cached
+        viewState = cached.isEmpty ? .loading : .populated
 
-            // Save to GRDB cache
-            if let serverId = appState.activeServerId {
-                try? appState.databaseManager.saveArtists(artists, serverId: serverId)
-                appState.refreshLibraryMembershipIds()
-                appState.artists = (try? appState.databaseManager.loadAdmittedArtists(serverId: serverId)) ?? artists
-            }
-        } catch let error as ResonanceError {
-            if appState.artists.isEmpty {
-                viewState = .error(error)
-            }
+        do {
+            let artists = try await appState.networkActor.fetchArtists(expectedServerID: serverUUID)
+            guard !Task.isCancelled, generation == loadGeneration,
+                  appState.activeServerId == serverId else { return }
+
+            try appState.databaseManager.saveArtists(artists, serverId: serverId)
+            let admitted = try appState.databaseManager.loadAdmittedArtists(serverId: serverId)
+            appState.refreshLibraryMembershipIds()
+            appState.artists = admitted
+            viewState = admitted.isEmpty ? .empty : .populated
         } catch {
+            guard !Task.isCancelled, generation == loadGeneration,
+                  appState.activeServerId == serverId else { return }
             if appState.artists.isEmpty {
-                viewState = .error(.networkUnavailable)
+                viewState = .error((error as? ResonanceError) ?? .networkUnavailable)
             }
+        }
+    }
+
+}
+
+// MARK: - Captured artist browser structure
+
+private struct ArtistBrowserView: View {
+    @Environment(AppState.self) private var appState
+    let artists: [Artist]
+    @State private var selectedArtistID: String?
+
+    var body: some View {
+        // Aug22 Artists: rail width300, adjacent detail starts301. Native
+        // resize constraints and selected-detail rendering remain unrecovered.
+        HStack(spacing: 0) {
+            List(selection: $selectedArtistID) {
+                ForEach(artists) { artist in
+                    ArtistRow(artist: artist, showsAlbumCount: false)
+                        .help("\(artist.name), \(artist.albumCount) albums")
+                        .tag(artist.id)
+                        .contextMenu {
+                            LibraryArtistContextMenu(artist: artist)
+                        }
+                }
+            }
+            .listStyle(.inset)
+            .scrollContentBackground(.hidden)
+            .background(Color(nsColor: .controlBackgroundColor))
+            .frame(width: 300)
+            .accessibilityLabel("Artists")
+
+            Divider()
+                .frame(width: 1)
+
+            Group {
+                if let selectedArtistID,
+                   let artist = artists.first(where: { $0.id == selectedArtistID }) {
+                    ArtistDetailView(artist: artist)
+                        .id(artist.id)
+                } else {
+                    Text("Select an Artist")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            .frame(minWidth: 0, maxWidth: .infinity, maxHeight: .infinity)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onChange(of: appState.activeServerId) { _, _ in
+            selectedArtistID = nil
         }
     }
 }
@@ -210,34 +276,113 @@ struct ArtistListView: View {
 // MARK: - Grid Layout (circular photos)
 
 struct ArtistGridView: View {
+    @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let artists: [Artist]
 
+    @State private var selectedArtistId: String?
+    @State private var viewportWidth: CGFloat = 0
+    @FocusState private var isGridFocused: Bool
+
+    private let cardPitch: CGFloat = 156 // 140pt card + 16pt spacing
     private let columns = [
-        GridItem(.adaptive(minimum: 140, maximum: 180), spacing: 16)
+        GridItem(.adaptive(minimum: 140, maximum: 140), spacing: 16)
     ]
 
+    // Base vertical movement on the live viewport so narrow windows and an open
+    // inspector do not skip or undershoot rows.
+    private var estimatedColumnsPerRow: Int {
+        let availableWidth = max(0, viewportWidth - 48)
+        return max(1, Int((availableWidth + 16) / cardPitch))
+    }
+
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 20) {
-                ForEach(artists) { artist in
-                    NavigationLink(value: artist) {
-                        ArtistGridCard(artist: artist)
-                    }
-                    .buttonStyle(.plain)
-                    .contextMenu {
-                        LibraryArtistContextMenu(artist: artist)
+        ScrollViewReader { proxy in
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 20) {
+                    ForEach(artists) { artist in
+                        NavigationLink(value: artist) {
+                            ArtistGridCard(artist: artist, isSelected: selectedArtistId == artist.id)
+                        }
+                        .buttonStyle(.plain)
+                        .id(artist.id)
+                        .simultaneousGesture(
+                            TapGesture(count: 1).onEnded { selectedArtistId = artist.id }
+                        )
+                        .contextMenu {
+                            LibraryArtistContextMenu(artist: artist)
+                        }
                     }
                 }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 24)
             }
-            .padding(.horizontal, 24)
-            .padding(.bottom, 24)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { viewportWidth = geometry.size.width }
+                        .onChange(of: geometry.size.width) { _, width in
+                            viewportWidth = width
+                        }
+                }
+            }
+            .focusable()
+            .focused($isGridFocused)
+            .focusEffectDisabled()
+            .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) { press in
+                handleArrowKey(press.key, proxy: proxy)
+            }
+            .onKeyPress(keys: [.return, .space]) { press in
+                openSelectedArtist()
+            }
         }
+        .onAppear {
+            isGridFocused = true
+        }
+        .onChange(of: artists.map(\.id), initial: true) { _, visibleIDs in
+            if let selectedArtistId, !visibleIDs.contains(selectedArtistId) {
+                self.selectedArtistId = nil
+            }
+        }
+    }
+
+    private func handleArrowKey(_ key: KeyEquivalent, proxy: ScrollViewProxy) -> KeyPress.Result {
+        let navigator = GridNavigator(itemCount: artists.count, columnsPerRow: estimatedColumnsPerRow)
+
+        let currentIndex: Int?
+        if let selectedArtistId {
+            currentIndex = artists.firstIndex(where: { $0.id == selectedArtistId })
+        } else {
+            currentIndex = nil
+        }
+
+        if let newIndex = navigator.navigate(from: currentIndex, direction: key),
+           newIndex >= 0, newIndex < artists.count {
+            let newId = artists[newIndex].id
+            selectedArtistId = newId
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
+                proxy.scrollTo(newId, anchor: .center)
+            }
+            return .handled
+        }
+        return .ignored
+    }
+
+    /// Opens the selected artist through the shared detail path so keyboard
+    /// activation matches clicking a card.
+    private func openSelectedArtist() -> KeyPress.Result {
+        guard let artist = selectedArtistId.flatMap({ id in artists.first(where: { $0.id == id }) })
+                ?? artists.first else { return .ignored }
+        selectedArtistId = artist.id
+        appState.detailNavigationPath.append(artist)
+        return .handled
     }
 }
 
 struct ArtistGridCard: View {
-    @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let artist: Artist
+    var isSelected: Bool = false
     @State private var isHovered = false
 
     var body: some View {
@@ -245,14 +390,19 @@ struct ArtistGridCard: View {
             // Circular artist image
             ArtistImageView(artistId: artist.id, coverArt: artist.coverArt)
                 .frame(width: 120, height: 120)
+                .overlay {
+                    Circle()
+                        .stroke(Color.accentColor, lineWidth: isSelected ? 3 : 0)
+                }
                 .shadow(color: .black.opacity(isHovered ? 0.2 : 0.1), radius: isHovered ? 8 : 4)
-                .scaleEffect(isHovered ? 1.03 : 1.0)
+                .scaleEffect(isHovered && !reduceMotion ? 1.03 : 1.0)
 
             // Name
             Text(artist.name)
                 .font(.subheadline)
                 .fontWeight(.medium)
                 .lineLimit(1)
+                .truncationMode(.tail)
 
             // Album count
             Text("\(artist.albumCount) albums")
@@ -260,7 +410,9 @@ struct ArtistGridCard: View {
                 .foregroundStyle(.secondary)
         }
         .onHover { isHovered = $0 }
-        .animation(.easeOut(duration: 0.15), value: isHovered)
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isHovered)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(artist.name), \(artist.albumCount) albums")
     }
 }
 
@@ -335,6 +487,8 @@ struct CompactArtistRow: View {
         .background(isHovered ? Color.primary.opacity(0.05) : Color.clear)
         .cornerRadius(6)
         .onHover { isHovered = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(artist.name), \(artist.albumCount) albums")
     }
 }
 
@@ -441,6 +595,12 @@ struct ArtistDetailView: View {
     @State private var viewState: ViewState = .loading
     @State private var topSongs: [Song] = []
     @State private var isLoadingTopSongs = true
+    @State private var isStarred: Bool
+
+    init(artist: Artist) {
+        self.artist = artist
+        self._isStarred = State(initialValue: artist.starred != nil)
+    }
 
     enum ViewState {
         case loading
@@ -457,20 +617,6 @@ struct ArtistDetailView: View {
             !appState.hiddenAlbumIds.contains($0.id) &&
             (!isArtistAdmitted || appState.admittedAlbumIds.contains($0.id))
         }
-    }
-
-    /// Full albums (5+ tracks), sorted by year descending
-    private var fullAlbums: [Album] {
-        albums
-            .filter { $0.songCount >= 5 }
-            .sorted { ($0.year ?? 0) > ($1.year ?? 0) }
-    }
-
-    /// Singles and EPs (< 5 tracks), sorted by year descending
-    private var singlesAndEPs: [Album] {
-        albums
-            .filter { $0.songCount < 5 && $0.songCount > 0 }
-            .sorted { ($0.year ?? 0) > ($1.year ?? 0) }
     }
 
     /// Latest release (most recent by year)
@@ -552,7 +698,7 @@ struct ArtistDetailView: View {
                     } else {
                         VStack(alignment: .leading, spacing: 32) {
                             // Latest Release
-                            if let latest = latestRelease {
+                            if albums.count > 1, let latest = latestRelease {
                                 LatestReleaseSection(
                                     album: latest,
                                     onPlay: {
@@ -582,30 +728,18 @@ struct ArtistDetailView: View {
                                 )
                             }
 
-                            // Albums (full length)
-                            if !fullAlbums.isEmpty {
-                                ArtistAlbumsSection(
-                                    title: "Albums",
-                                    albums: fullAlbums,
-                                    onPlayAlbum: playAlbum,
-                                    onAddAlbumToQueue: addAlbumToQueue
-                                )
-                            }
-
-                            // Singles & EPs
-                            if !singlesAndEPs.isEmpty {
-                                ArtistAlbumsSection(
-                                    title: "Singles & EPs",
-                                    albums: singlesAndEPs,
-                                    onPlayAlbum: playAlbum,
-                                    onAddAlbumToQueue: addAlbumToQueue
-                                )
-                            }
+                            ArtistAlbumsSection(
+                                title: "Releases",
+                                albums: albums.sorted { ($0.year ?? 0) > ($1.year ?? 0) },
+                                onPlayAlbum: playAlbum,
+                                onAddAlbumToQueue: addAlbumToQueue
+                            )
                         }
-                        .padding(.horizontal)
+                        .padding(.horizontal, 28)
                     }
                 }
             }
+            .padding(.bottom, 100)
         }
         .navigationTitle(displayName)
         .toolbar {
@@ -644,14 +778,13 @@ struct ArtistDetailView: View {
                         Task { await toggleArtistStar() }
                     } label: {
                         Label(
-                            artist.starred != nil ? "Remove from Favorites" : "Add to Favorites",
-                            systemImage: artist.starred != nil ? "heart.fill" : "heart"
+                            isStarred ? "Remove from Favorites" : "Add to Favorites",
+                            systemImage: isStarred ? "heart.fill" : "heart"
                         )
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
                 }
-                .disabled(albums.isEmpty)
             }
         }
         .task {
@@ -841,10 +974,12 @@ struct ArtistDetailView: View {
 
     private func toggleArtistStar() async {
         do {
-            if artist.starred != nil {
+            if isStarred {
                 try await appState.networkActor.unstar(id: artist.id, type: .artist)
+                isStarred = false
             } else {
                 try await appState.networkActor.star(id: artist.id, type: .artist)
+                isStarred = true
             }
         } catch {
             // Error handled silently
@@ -864,16 +999,17 @@ struct ArtistHeaderView: View {
     let isDisabled: Bool
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 24) {
+        HStack(alignment: .center, spacing: 24) {
             // Artist image (circular, using album art as fallback)
             EnvironmentAlbumArtView(coverArtId: coverArt, size: .large)
-                .frame(width: 200, height: 200)
+                .frame(width: 144, height: 144)
                 .clipShape(Circle())
-                .shadow(color: .black.opacity(0.2), radius: 15, x: 0, y: 8)
+                .shadow(color: .black.opacity(0.08), radius: 8, x: 0, y: 4)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Artist")
-                    .font(.subheadline)
+                Text("ARTIST")
+                    .font(.caption.weight(.medium))
+                    .tracking(1)
                     .foregroundStyle(.secondary)
 
                 Text(name)
@@ -881,14 +1017,12 @@ struct ArtistHeaderView: View {
                     .fontWeight(.bold)
 
                 HStack(spacing: 8) {
-                    Text("\(albumCount) albums")
-                    Text("-")
-                    Text("\(songCount) songs")
+                    Text("\(albumCount) \(albumCount == 1 ? "release" : "releases")")
+                    Text("·")
+                    Text("\(songCount) \(songCount == 1 ? "song" : "songs") in your library")
                 }
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
-
-                Spacer()
 
                 HStack(spacing: 12) {
                     Button(action: onPlay) {
@@ -903,18 +1037,21 @@ struct ArtistHeaderView: View {
                     .buttonStyle(.bordered)
                     .disabled(isDisabled)
                 }
+                .padding(.top, 12)
             }
 
             Spacer()
         }
-        .padding(24)
-        .padding(.top, 16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 28)
+        .padding(.top, 28)
     }
 }
 
 // MARK: - Latest Release Section
 
 struct LatestReleaseSection: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let album: Album
     let onPlay: () async -> Void
     let onShuffle: () async -> Void
@@ -927,60 +1064,52 @@ struct LatestReleaseSection: View {
                 .font(.title2)
                 .fontWeight(.semibold)
 
-            NavigationLink(value: album) {
-                HStack(spacing: 16) {
+            HStack(spacing: 20) {
+                NavigationLink(value: album) {
                     EnvironmentAlbumArtView(coverArtId: album.coverArt, size: .large)
-                        .frame(width: 160, height: 160)
+                        .frame(width: 112, height: 112)
                         .clipShape(RoundedRectangle(cornerRadius: 8))
                         .shadow(color: .black.opacity(isHovered ? 0.15 : 0.08), radius: isHovered ? 12 : 8)
-                        .scaleEffect(isHovered ? 1.02 : 1.0)
-                        .animation(.easeOut(duration: 0.15), value: isHovered)
+                        .scaleEffect(isHovered && !reduceMotion ? 1.02 : 1.0)
+                        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: isHovered)
 
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(album.name)
-                            .font(.title3)
-                            .fontWeight(.semibold)
-                            .lineLimit(2)
+                }
+                .buttonStyle(.plain)
 
-                        HStack(spacing: 6) {
-                            if let year = album.year {
-                                Text(String(year))
-                            }
-                            if album.songCount > 0 {
-                                Text("-")
-                                Text("\(album.songCount) songs")
-                            }
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(album.name)
+                        .font(.title3)
+                        .fontWeight(.semibold)
+                        .lineLimit(2)
+
+                    HStack(spacing: 6) {
+                        if let year = album.year {
+                            Text(String(year))
                         }
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                        Spacer()
-
-                        HStack(spacing: 8) {
-                            Button {
-                                Task { await onPlay() }
-                            } label: {
-                                Label("Play", systemImage: "play.fill")
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .controlSize(.small)
-
-                            Text("View Album")
-                                .font(.callout)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 4)
-                                .background(.quaternary)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
+                        if album.songCount > 0 {
+                            Text("·")
+                            Text("\(album.songCount) \(album.songCount == 1 ? "song" : "songs")")
                         }
                     }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
 
-                    Spacer()
+                    HStack(spacing: 8) {
+                        Button {
+                            Task { await onPlay() }
+                        } label: {
+                            Label("Play", systemImage: "play.fill")
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+
+                        NavigationLink("View Album", value: album)
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
                 }
-                .padding()
-                .background {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(.regularMaterial)
-                }
+
+                Spacer()
             }
             .buttonStyle(.plain)
             .onHover { isHovered = $0 }
@@ -1068,11 +1197,9 @@ struct TopSongsSection: View {
                     }
                 }
             }
-            .padding()
-            .background {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(.regularMaterial)
-            }
+            .padding(.vertical, 6)
+            .overlay(alignment: .top) { Divider() }
+            .overlay(alignment: .bottom) { Divider() }
         }
     }
 
@@ -1120,6 +1247,8 @@ struct TopSongRow: View {
         .contentShape(Rectangle())
         .background(isHovered ? Color.primary.opacity(0.05) : Color.clear)
         .onHover { isHovered = $0 }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Top song \(index): \(song.title) by \(song.artist) from \(song.album), \(song.formattedDuration)")
     }
 }
 
@@ -1139,10 +1268,19 @@ struct ArtistAlbumsSection: View {
 
             LazyVGrid(columns: [GridItem(.adaptive(minimum: 180))], spacing: 20) {
                 ForEach(albums) { album in
-                    NavigationLink(value: album) {
-                        AlbumCard(album: album)
+                    AlbumCardActionSurface(
+                        album: album,
+                        onPlay: { Task { await onPlayAlbum(album, false) } }
+                    ) { artworkHoverChanged in
+                        NavigationLink(value: album) {
+                            AlbumCard(
+                                album: album,
+                                showsHoverPlayButton: false,
+                                onArtworkHoverChange: artworkHoverChanged
+                            )
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                     .contextMenu {
                         Button {
                             Task {

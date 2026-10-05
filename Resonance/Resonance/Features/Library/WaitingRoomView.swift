@@ -423,7 +423,7 @@ struct WaitingRoomView: View {
                 .loadWaitingRoomItems(serverId: serverId, includeDecided: true)
                 .filter { !appState.hiddenSongIds.contains($0.song.id) || $0.state == .rejected }
             let loadedAttributions = try appState.databaseManager
-                .sourceAttributionsBySongId(songs: loadedItems.map(\.song))
+                .sourceAttributionsBySongId(songs: loadedItems.map(\.song), serverId: serverId)
             var loadedDossiers: [String: DossierStory] = [:]
             for item in loadedItems {
                 loadedDossiers[item.id] = try appState.databaseManager.dossierStory(

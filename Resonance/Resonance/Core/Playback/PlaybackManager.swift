@@ -21,12 +21,142 @@ final class PlaybackManager: ObservableObject {
     private let notificationService = NotificationService()
 
     /// Active server ID for database operations (set by AppState on connect)
-    var activeServerId: String = ""
+    var activeServerId: String = "" {
+        didSet {
+            if activeServerId != oldValue { invalidateForServerChange() }
+        }
+    }
+
+    /// Invalidates pending AutoPlay discovery when a newer transport intent arrives.
+    /// This does not serialize the separate audio-loading pipeline.
+    private var playbackIntentGeneration: UInt64 = 0 {
+        didSet {
+            if restoreStartTask != nil {
+                restoreStartTask?.cancel()
+                isBuffering = false
+            }
+        }
+    }
+    private var restoreStartTask: Task<Void, Never>?
+    private var restoreStartID: UUID?
+    private var stagedRestore: StagedRestore?
+    private var audioOwnershipID: UUID?
+    /// Separates overlapping position requests without turning seeks into new
+    /// playback intents (which also coordinate launch restoration).
+    private var seekGeneration: UInt64 = 0
+
+    struct RestoreTicket: Equatable {
+        let intent: UInt64
+        let occurrence: UUID
+        let serverID: String
+    }
+    private struct StagedRestore {
+        let occurrence: UUID
+        let serverID: String
+        var position: TimeInterval
+    }
+
+    func invalidateRestoration() {
+        playbackIntentGeneration &+= 1
+        stagedRestore = nil
+    }
+
+    /// Synchronous identity boundary; cleanup only owns the displaced audio request.
+    func invalidateForServerChange() {
+        invalidateRestoration()
+        // Identity is assigned before the fixture seeds PlaybackManager's flag.
+        guard !DeterministicCaptureFixture.isEnabled else { return }
+        finalizePlayDuration()
+        if let id = audioOwnershipID {
+            let audio = audioActor
+            Task { await audio.cancelRestoration(id: id) }
+        }
+        audioOwnershipID = nil
+        currentExternalStream = nil
+        currentSourceSupportsSeeking = true
+        isPlaying = false
+        isBuffering = false
+        currentTime = 0
+        duration = 0
+        nowPlayingService.clear()
+    }
+
+    /// No startPlayback/audio/service calls: this is genuinely paused restoration.
+    func stagePausedRestore(songs: [Song], startingAt index: Int, position: TimeInterval,
+                            serverID: String) -> RestoreTicket? {
+        guard !deterministicCaptureMode, queueManager.isEmpty, !songs.isEmpty,
+              serverID == activeServerId, !serverID.isEmpty else { return nil }
+        queueManager.play(songs, startingAt: max(0, min(index, songs.count - 1)))
+        guard let item = queueManager.currentItem else { return nil }
+        duration = max(0, TimeInterval(item.song.duration))
+        currentTime = position.isFinite ? max(0, min(position, duration)) : 0
+        isPlaying = false
+        isBuffering = false
+        currentSourceSupportsSeeking = true
+        stagedRestore = StagedRestore(occurrence: item.id, serverID: serverID, position: currentTime)
+        return RestoreTicket(intent: playbackIntentGeneration, occurrence: item.id, serverID: serverID)
+    }
+
+    func resumeRestoredIfCurrent(ticket: RestoreTicket) async {
+        guard ticket.intent == playbackIntentGeneration,
+              ticket.serverID == activeServerId,
+              ticket.occurrence == queueManager.currentItem?.id,
+              stagedRestore?.occurrence == ticket.occurrence else { return }
+        await resume()
+    }
+
+    private func startStagedRestoreIfNeeded() async -> Bool {
+        guard let staged = stagedRestore else { return false }
+        guard staged.serverID == activeServerId,
+              let item = queueManager.currentItem, item.id == staged.occurrence else {
+            stagedRestore = nil
+            return false
+        }
+        let intent = playbackIntentGeneration
+        let audioRestoreID = UUID()
+        let audio = audioActor
+        let task = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                try await withTaskCancellationHandler {
+                    try await self.startPlayback(for: item.song, initialPosition: staged.position,
+                        restoration: RestoreTicket(intent: intent, occurrence: item.id, serverID: staged.serverID),
+                        audioRestorationID: audioRestoreID)
+                } onCancel: {
+                    Task { await audio.cancelRestoration(id: audioRestoreID) }
+                }
+                if self.playbackIntentGeneration == intent {
+                    self.stagedRestore = nil
+                }
+            } catch is CancellationError {
+                await audio.cancelRestoration(id: audioRestoreID)
+                // Keep the staged position on pause; replacement/server guards reject it.
+            } catch {
+                if self.playbackIntentGeneration == intent { self.playbackError = error }
+            }
+        }
+        restoreStartID = audioRestoreID
+        restoreStartTask = task
+        await task.value
+        if restoreStartID == audioRestoreID {
+            restoreStartTask = nil
+            restoreStartID = nil
+        }
+        return true
+    }
+
+    private func checkRestoration(_ ticket: RestoreTicket?) throws {
+        guard let ticket else { return }
+        try Task.checkCancellation()
+        guard playbackIntentGeneration == ticket.intent, activeServerId == ticket.serverID,
+              queueManager.currentItem?.id == ticket.occurrence else { throw CancellationError() }
+    }
 
     // MARK: - Navigation State
 
     var canGoPrevious: Bool {
-        !queueManager.history.isEmpty || (currentSourceSupportsSeeking && currentTime > 3)
+        queueManager.hasPrevious || (currentSourceSupportsSeeking && currentTime > 3)
     }
 
     var canGoNext: Bool {
@@ -40,6 +170,7 @@ final class PlaybackManager: ObservableObject {
     private var currentTrackedServerId: String?
     private var playbackStartedAt: Date?
     private var currentExternalStream: ExternalStreamSource?
+    private var deterministicCaptureMode = false
 
     private struct ExternalStreamSource {
         let songID: String
@@ -81,14 +212,46 @@ final class PlaybackManager: ObservableObject {
         }
     }
 
+    /// Seeds published playback state for the launch-only capture fixture.
+    /// This intentionally bypasses `startPlayback(for:)`: no URL resolution,
+    /// cache lookup, network request, or AVPlayer item is created.
+    func installDeterministicCaptureFixture(
+        isPlaying: Bool,
+        currentTime: TimeInterval,
+        duration: TimeInterval,
+        supportsSeeking: Bool
+    ) {
+        deterministicCaptureMode = true
+        scrobbleTask?.cancel()
+        currentExternalStream = nil
+        playbackError = nil
+        isBuffering = false
+        currentSourceSupportsSeeking = supportsSeeking
+        self.duration = max(0, duration)
+        self.currentTime = max(0, min(currentTime, self.duration))
+        self.isPlaying = isPlaying
+    }
+
     // MARK: - Playback Control
 
     func play(song: Song, useCrossfade: Bool = false) async {
-        guard isVisibleForPlayback(song) else { return }
+        invalidateRestoration()
+        if deterministicCaptureMode {
+            isBuffering = false
+            currentTime = 0
+            duration = max(0, TimeInterval(song.duration))
+            isPlaying = true
+            return
+        }
 
+        guard isVisibleForPlayback(song) else { return }
+        let intent = playbackIntentGeneration
         do {
             try await startPlayback(for: song, useCrossfade: useCrossfade)
+        } catch is CancellationError {
+            return
         } catch {
+            guard intent == playbackIntentGeneration else { return }
             currentExternalStream = nil
             currentSourceSupportsSeeking = true
             playbackError = error
@@ -96,9 +259,21 @@ final class PlaybackManager: ObservableObject {
     }
 
     func play(station: InternetRadioStation) async throws {
+        invalidateRestoration()
+        if deterministicCaptureMode {
+            isBuffering = false
+            isPlaying = true
+            return
+        }
+
         guard let scheme = station.streamUrl.scheme?.lowercased(),
               scheme == "http" || scheme == "https" else {
             throw ResonanceError.unsupportedFormat(station.streamUrl.scheme ?? "station")
+        }
+        // Station URLs come from the server and can point anywhere; the
+        // showcase build only plays streams from its loopback demo server.
+        guard PublicDemoConfiguration.allowsNetworkURL(station.streamUrl) else {
+            throw ResonanceError.publicDemoRequiresLocalServer
         }
 
         let radioSong = makeRadioSong(from: station)
@@ -108,10 +283,14 @@ final class PlaybackManager: ObservableObject {
             supportsSeeking: false
         )
 
+        let intent = playbackIntentGeneration
         do {
             try await startPlayback(for: radioSong)
             queueManager.play([radioSong], startingAt: 0)
+        } catch is CancellationError {
+            throw CancellationError()
         } catch {
+            guard intent == playbackIntentGeneration else { throw CancellationError() }
             currentExternalStream = nil
             currentSourceSupportsSeeking = true
             throw error
@@ -171,6 +350,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func play(songs: [Song], startingAt index: Int = 0) async {
+        playbackIntentGeneration &+= 1
         let hiddenIds = hiddenPlaybackIds()
         let visibleIndexedSongs = songs.enumerated()
             .filter { isVisibleForPlayback($0.element, hiddenIds: hiddenIds) }
@@ -187,9 +367,16 @@ final class PlaybackManager: ObservableObject {
     }
 
     func togglePlayPause() async {
+        playbackIntentGeneration &+= 1
+        if deterministicCaptureMode {
+            isPlaying.toggle()
+            return
+        }
+
         if isPlaying {
             await pause()
         } else {
+            if await startStagedRestoreIfNeeded() { return }
             // Try to resume; if no audio is loaded, play the current song from queue
             do {
                 try await audioActor.resume()
@@ -209,6 +396,13 @@ final class PlaybackManager: ObservableObject {
     }
 
     func pause() async {
+        playbackIntentGeneration &+= 1
+        isBuffering = false
+        if deterministicCaptureMode {
+            isPlaying = false
+            return
+        }
+
         await audioActor.pause()
         isPlaying = false
 
@@ -218,6 +412,13 @@ final class PlaybackManager: ObservableObject {
     }
 
     func resume() async {
+        playbackIntentGeneration &+= 1
+        if deterministicCaptureMode {
+            isPlaying = true
+            return
+        }
+        if await startStagedRestoreIfNeeded() { return }
+
         do {
             try await audioActor.resume()
             isPlaying = true
@@ -237,6 +438,17 @@ final class PlaybackManager: ObservableObject {
     }
 
     func stop() async {
+        invalidateRestoration()
+        if deterministicCaptureMode {
+            scrobbleTask?.cancel()
+            isPlaying = false
+            currentTime = 0
+            duration = 0
+            currentExternalStream = nil
+            currentSourceSupportsSeeking = true
+            return
+        }
+
         finalizePlayDuration()
         await audioActor.stop()
         isPlaying = false
@@ -279,13 +491,61 @@ final class PlaybackManager: ObservableObject {
     }
 
     func seek(to time: TimeInterval) async {
-        guard currentSourceSupportsSeeking else { return }
-        await audioActor.seek(to: time)
-        currentTime = time
+        await seek(to: time, performAudioSeek: { [audioActor] target, ownershipID, requestGeneration in
+            await audioActor.seek(to: target, expecting: ownershipID, requestGeneration: requestGeneration)
+        })
+    }
 
-        if let song = queueManager.currentItem?.song {
-            nowPlayingService.update(song: song, isPlaying: isPlaying, currentTime: time, duration: duration)
+    /// The injected operation keeps async completion ownership testable without
+    /// constructing or mutating a live AVPlayer.
+    func seek(to time: TimeInterval,
+              performAudioSeek: @MainActor (TimeInterval, UUID?, UInt64) async -> Bool) async {
+        guard currentSourceSupportsSeeking else { return }
+
+        // Every newer request supersedes an older completion, including a
+        // staged/deterministic seek or a request made after the queue emptied.
+        seekGeneration &+= 1
+        let requestGeneration = seekGeneration
+        let seekDuration = duration.isFinite ? max(0, duration) : 0
+        let target = time.isFinite ? min(seekDuration, max(0, time)) : 0
+
+        if var staged = stagedRestore, staged.serverID == activeServerId,
+           staged.occurrence == queueManager.currentItem?.id {
+            playbackIntentGeneration &+= 1
+            staged.position = target
+            stagedRestore = staged
+            currentTime = staged.position
+            return
         }
+
+        if deterministicCaptureMode {
+            currentTime = target
+            return
+        }
+
+        guard let item = queueManager.currentItem else { return }
+        let intent = playbackIntentGeneration
+        let serverID = activeServerId
+        let occurrenceID = item.id
+        let song = item.song
+        let ownershipID = audioOwnershipID
+
+        let didSeek = await performAudioSeek(target, ownershipID, requestGeneration)
+
+        // AudioActor and AVPlayer calls are async/reentrant. Do not let an old
+        // completion publish its target against a replacement queue item,
+        // server, transport intent, or newer seek request.
+        guard didSeek,
+              let currentItem = queueManager.currentItem,
+              seekGeneration == requestGeneration,
+              playbackIntentGeneration == intent,
+              activeServerId == serverID,
+              currentItem.id == occurrenceID,
+              currentItem.song.id == song.id,
+              currentSourceSupportsSeeking else { return }
+
+        currentTime = target
+        nowPlayingService.update(song: currentItem.song, isPlaying: isPlaying, currentTime: target, duration: duration)
     }
 
     func setVolume(_ volume: Float) {
@@ -295,6 +555,19 @@ final class PlaybackManager: ObservableObject {
     }
 
     func next() async {
+        playbackIntentGeneration &+= 1
+        if deterministicCaptureMode {
+            if let nextItem = queueManager.next(repeatAll: repeatMode == .all) {
+                currentTime = 0
+                duration = TimeInterval(nextItem.song.duration)
+            } else {
+                isPlaying = false
+                currentTime = 0
+                duration = 0
+            }
+            return
+        }
+
         let repeatAll = repeatMode == .all
         let hiddenIds = hiddenPlaybackIds()
         var remainingAttempts = max(queueManager.count, 1)
@@ -320,6 +593,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func previous() async {
+        playbackIntentGeneration &+= 1
         // If past 3 seconds, restart current track
         if currentSourceSupportsSeeking && currentTime > 3 {
             await seek(to: 0)
@@ -372,6 +646,7 @@ final class PlaybackManager: ObservableObject {
     }
 
     func playNow(_ song: Song) async {
+        playbackIntentGeneration &+= 1
         guard isVisibleForPlayback(song) else { return }
 
         if queueManager.isEmpty {
@@ -387,11 +662,41 @@ final class PlaybackManager: ObservableObject {
 
     // MARK: - AutoPlay
 
+    /// Also invalidates off→on preference changes while discovery is suspended.
+    func invalidatePendingAutoPlay() {
+        playbackIntentGeneration &+= 1
+    }
+
     private func fetchAndPlayAutoPlay(seedSong: Song) async {
+        let generation = playbackIntentGeneration
+        let serverId = activeServerId
+        let seedOccurrenceId = queueManager.history.last?.id
+
+        // Queue item identity distinguishes repeated plays of the same song.
+        // Check errors as well as successful responses: an obsolete failure must
+        // never stop playback started while discovery was awaiting the server.
+        func requestIsCurrent() -> Bool {
+            !Task.isCancelled
+                && playbackIntentGeneration == generation
+                && !serverId.isEmpty
+                && activeServerId == serverId
+                && seedOccurrenceId != nil
+                && queueManager.history.last?.id == seedOccurrenceId
+                && queueManager.currentItem == nil
+                && !queueManager.hasNext
+                && UserDefaults.standard.bool(forKey: "isAutoPlayEnabled")
+        }
+
+        guard requestIsCurrent(), let expectedServerID = UUID(uuidString: serverId) else { return }
         do {
+            let response = try await networkActor.getSimilarSongs(
+                id: seedSong.id, count: 20, expectedServerID: expectedServerID
+            )
+            guard requestIsCurrent() else { return }
+
+            // Curation can change while the request is suspended.
             let hiddenIds = hiddenPlaybackIds()
-            let similarSongs = try await networkActor.getSimilarSongs(id: seedSong.id, count: 20)
-                .filter { isVisibleForPlayback($0, hiddenIds: hiddenIds) }
+            let similarSongs = response.filter { isVisibleForPlayback($0, hiddenIds: hiddenIds) }
             guard !similarSongs.isEmpty else {
                 await stop()
                 return
@@ -399,13 +704,15 @@ final class PlaybackManager: ObservableObject {
 
             queueManager.setAutoPlayItems(similarSongs)
 
-            // Now try next() again — it will pull from autoPlayItems
+            // Pull from the existing sectioned queue, retaining its deduplication
+            // and manual/base/autoplay ordering semantics.
             if let nextItem = queueManager.next() {
                 await play(song: nextItem.song, useCrossfade: true)
             } else {
                 await stop()
             }
         } catch {
+            guard !(error is CancellationError), requestIsCurrent() else { return }
             print("AutoPlay fetch failed: \(error)")
             await stop()
         }
@@ -462,6 +769,8 @@ final class PlaybackManager: ObservableObject {
     }
 
     private func scrobble(song: Song) async {
+        guard !deterministicCaptureMode else { return }
+
         do {
             try await networkActor.scrobble(id: song.id, time: Date(), submission: true)
         } catch {
@@ -517,27 +826,45 @@ final class PlaybackManager: ObservableObject {
         return nil
     }
 
-    private func startPlayback(for song: Song, useCrossfade: Bool = false) async throws {
+    private func startPlayback(for song: Song, useCrossfade: Bool = false,
+                               initialPosition: TimeInterval = 0,
+                               restoration: RestoreTicket? = nil,
+                               audioRestorationID: UUID? = nil) async throws {
+        let intent = playbackIntentGeneration
+        let serverID = activeServerId
+        let ownership = audioRestorationID ?? UUID()
+        audioOwnershipID = ownership
+        func checkCurrentIntent() throws {
+            try Task.checkCancellation()
+            guard intent == playbackIntentGeneration, serverID == activeServerId else { throw CancellationError() }
+            try checkRestoration(restoration)
+        }
+        try checkCurrentIntent()
         finalizePlayDuration()
 
         playbackError = nil
         isBuffering = true
-        defer { isBuffering = false }
-
-        let playbackURL = try await resolvePlaybackURL(for: song)
-
-        let crossfadeDuration = await audioActor.getCrossfadeDuration()
-        let shouldCrossfade = useCrossfade && currentSourceSupportsSeeking && isPlaying && crossfadeDuration > 0
-        if shouldCrossfade {
-            try await audioActor.crossfadeTo(url: playbackURL)
-        } else {
-            try await audioActor.play(url: playbackURL)
+        defer {
+            if intent == playbackIntentGeneration, serverID == activeServerId { isBuffering = false }
         }
 
-        isPlaying = true
-        currentTime = 0
+        let playbackURL = try await resolvePlaybackURL(for: song)
+        try checkCurrentIntent()
+
+        let crossfadeDuration = await audioActor.getCrossfadeDuration()
+        try checkCurrentIntent()
+        let shouldCrossfade = useCrossfade && currentSourceSupportsSeeking && isPlaying && crossfadeDuration > 0
+        if shouldCrossfade {
+            try await audioActor.crossfadeTo(url: playbackURL, ownershipID: ownership)
+        } else {
+            try await audioActor.play(url: playbackURL, initialPosition: initialPosition, restorationID: ownership)
+        }
+        try checkCurrentIntent()
 
         let loadedDuration = await audioActor.getDuration()
+        try checkCurrentIntent()
+        isPlaying = true
+        currentTime = max(0, min(initialPosition, loadedDuration))
         duration = loadedDuration.isFinite ? max(0, loadedDuration) : 0
         if duration == 0 {
             currentSourceSupportsSeeking = false
@@ -551,7 +878,8 @@ final class PlaybackManager: ObservableObject {
             await audioActor.resetReplayGain()
         }
 
-        nowPlayingService.update(song: song, isPlaying: true, currentTime: 0, duration: duration)
+        try checkCurrentIntent()
+        nowPlayingService.update(song: song, isPlaying: true, currentTime: currentTime, duration: duration)
 
         if currentExternalStream == nil {
             currentPlayHistoryId = try? databaseManager.recordPlay(song: song, serverId: activeServerId)

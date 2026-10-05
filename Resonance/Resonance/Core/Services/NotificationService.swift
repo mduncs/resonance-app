@@ -16,7 +16,7 @@ final class NotificationService: ObservableObject {
     private var authorizationStatus: UNAuthorizationStatus = .notDetermined
 
     private var showNotifications: Bool {
-        UserDefaults.standard.bool(forKey: "showNotifications")
+        (UserDefaults.standard.object(forKey: "showNotifications") as? Bool) ?? true
     }
 
     private var showLyricsInNotifications: Bool {

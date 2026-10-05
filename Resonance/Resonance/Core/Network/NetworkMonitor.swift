@@ -5,8 +5,9 @@ import Combine
 @MainActor
 @Observable
 final class NetworkMonitor {
-    private let monitor = NWPathMonitor()
+    private let monitor: NWPathMonitor?
     private let queue = DispatchQueue(label: "NetworkMonitor")
+    let isInert: Bool
 
     private(set) var isConnected: Bool = true
     private(set) var isExpensive: Bool = false
@@ -19,16 +20,32 @@ final class NetworkMonitor {
         case unknown
     }
 
-    init() {
-        startMonitoring()
+    init(inert: Bool = false) {
+        self.isInert = inert
+        self.monitor = inert ? nil : NWPathMonitor()
+        if !inert {
+            startMonitoring()
+        } else {
+            // Fixture launches have no live connection state. Keep this
+            // deterministic and avoid creating a path-monitor source.
+            self.isConnected = true
+        }
+    }
+
+    convenience init(fixtureMode: Bool) {
+        self.init(inert: fixtureMode)
+    }
+
+    convenience init(isInert: Bool) {
+        self.init(inert: isInert)
     }
 
     deinit {
-        monitor.cancel()
+        monitor?.cancel()
     }
 
     private func startMonitoring() {
-        monitor.pathUpdateHandler = { [weak self] path in
+        monitor?.pathUpdateHandler = { [weak self] path in
             Task { @MainActor [weak self] in
                 self?.isConnected = path.status == .satisfied
                 self?.isExpensive = path.isExpensive
@@ -44,7 +61,7 @@ final class NetworkMonitor {
                 }
             }
         }
-        monitor.start(queue: queue)
+        monitor?.start(queue: queue)
     }
 
     func checkConnectivity() -> Bool {

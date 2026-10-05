@@ -20,7 +20,8 @@ extension UTType {
 struct QueueView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.dismiss) private var dismiss
-    @State private var draggingItem: UUID?
+    @State private var isConfirmingClear = false
+    @State private var dropTargetID: UUID?
     @State private var selectedItemIds = Set<UUID>()
     @FocusState private var isListFocused: Bool
     private let sectionDisplayLimit = 500
@@ -33,6 +34,10 @@ struct QueueView: View {
                 if let current = appState.queueManager.currentItem {
                     Section("Now Playing") {
                         QueueItemRow(item: current, isCurrent: true)
+                            .contextMenu {
+                                QuickCaptureMenu(song: current.song)
+                                Button("Get Info") { appState.getInfoContent = .song(current.song) }
+                            }
                     }
                 }
 
@@ -44,7 +49,6 @@ struct QueueView: View {
                         ForEach(Array(upNextItems.enumerated()), id: \.element.id) { offset, item in
                             QueueItemRow(item: item, isCurrent: false, showDragHandle: true)
                                 .tag(item.id)
-                                .opacity(draggingItem == item.id ? 0.5 : 1.0)
                                 .draggable(QueueItemTransfer(id: item.id, sourceIndex: offset)) {
                                     // Drag preview
                                     QueueItemRow(item: item, isCurrent: false)
@@ -53,23 +57,28 @@ struct QueueView: View {
                                         .cornerRadius(8)
                                 }
                                 .dropDestination(for: QueueItemTransfer.self) { items, _ in
-                                    guard let transfer = items.first else { return false }
-                                    // Find current source index by UUID
-                                    let currentUpNext = appState.queueManager.upNextItems
-                                    guard let currentSourceOffset = currentUpNext.firstIndex(where: { $0.id == transfer.id }) else {
-                                        return false
+                                    guard items.count == 1, let transfer = items.first else { return false }
+                                    return appState.queueManager.moveUpNextItem(id: transfer.id, onto: item.id)
+                                } isTargeted: { targeted in
+                                    if targeted {
+                                        dropTargetID = item.id
+                                    } else if dropTargetID == item.id {
+                                        dropTargetID = nil
                                     }
-                                    let destOffset = offset
-
-                                    if currentSourceOffset != destOffset {
-                                        let adjustedDest = destOffset > currentSourceOffset ? destOffset + 1 : destOffset
-                                        appState.queueManager.moveUpNext(
-                                            from: IndexSet(integer: currentSourceOffset),
-                                            to: adjustedDest
-                                        )
+                                }
+                                .overlay {
+                                    if dropTargetID == item.id {
+                                        RoundedRectangle(cornerRadius: 8)
+                                            .strokeBorder(Color.accentColor, lineWidth: 1)
+                                            .allowsHitTesting(false)
                                     }
-                                    return true
-                                } isTargeted: { _ in }
+                                }
+                                .accessibilityAction(named: "Move Up") {
+                                    moveManualItem(item.id, delta: -1)
+                                }
+                                .accessibilityAction(named: "Move Down") {
+                                    moveManualItem(item.id, delta: 1)
+                                }
                                 .contextMenu {
                                     queueItemContextMenu(item: item)
                                 }
@@ -126,7 +135,9 @@ struct QueueView: View {
                 if !history.isEmpty {
                     let displayedHistory = Array(history.suffix(historyDisplayLimit))
                     Section("History") {
-                        ForEach(displayedHistory.reversed()) { item in
+                        // Key by position: repeat plays can append duplicate
+                        // QueueItem ids to history.
+                        ForEach(Array(displayedHistory.reversed().enumerated()), id: \.offset) { _, item in
                             QueueItemRow(item: item, isCurrent: false)
                                 .opacity(0.6)
                         }
@@ -153,7 +164,7 @@ struct QueueView: View {
                     .disabled(appState.queueManager.allUpcomingCount == 0)
 
                     Button {
-                        appState.queueManager.clear()
+                        isConfirmingClear = true
                     } label: {
                         Image(systemName: "trash")
                     }
@@ -175,11 +186,13 @@ struct QueueView: View {
             .focused($isListFocused)
             .focusEffectDisabled()
             .onKeyPress(.delete) {
+                guard !selectedItemIds.isEmpty else { return .ignored }
                 deleteSelectedItems()
                 return .handled
             }
             .onKeyPress(keys: [KeyEquivalent("\u{7F}")]) { _ in
                 // Backspace key (same as delete on Mac keyboards without dedicated delete)
+                guard !selectedItemIds.isEmpty else { return .ignored }
                 deleteSelectedItems()
                 return .handled
             }
@@ -189,11 +202,25 @@ struct QueueView: View {
             }
             .onKeyPress(.return) {
                 // Enter: play first selected item
+                guard !selectedItemIds.isEmpty else { return .ignored }
                 playFirstSelectedItem()
                 return .handled
             }
         }
         .frame(minWidth: 350, minHeight: 400)
+        // Same consequence and recovery boundary as ContinuePlayingPanel.
+        .confirmationDialog(
+            "Clear all upcoming songs?",
+            isPresented: $isConfirmingClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) {
+                appState.queueManager.clear()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All \(appState.queueManager.allUpcomingCount) upcoming songs will be removed. The current song keeps playing.")
+        }
         .onAppear {
             isListFocused = true
         }
@@ -213,15 +240,11 @@ struct QueueView: View {
             Label("Play Now", systemImage: "play")
         }
 
-        Button(role: .destructive) {
-            appState.queueManager.remove(id: item.id)
-        } label: {
-            Label("Remove", systemImage: "minus.circle")
-        }
-
         Divider()
 
         Button {
+            appState.navigationTargetArtistId = nil
+            appState.navigationTargetSongId = nil
             appState.navigationTargetAlbumId = item.song.albumId
             appState.selectedSidebarItem = .albums
             dismiss()
@@ -231,6 +254,8 @@ struct QueueView: View {
         .disabled(item.song.albumId.isEmpty)
 
         Button {
+            appState.navigationTargetAlbumId = nil
+            appState.navigationTargetSongId = nil
             appState.navigationTargetArtistId = item.song.artistId
             appState.selectedSidebarItem = .artists
             dismiss()
@@ -238,10 +263,40 @@ struct QueueView: View {
             Label("Go to Artist", systemImage: "music.mic")
         }
         .disabled(item.song.artistId.isEmpty)
+
+        Divider()
+
+        QuickCaptureMenu(song: item.song)
+
+        Button("Get Info") { appState.getInfoContent = .song(item.song) }
+
+        if let index = appState.queueManager.upNextItems.firstIndex(where: { $0.id == item.id }) {
+            Divider()
+            Button("Move Up") { moveManualItem(item.id, delta: -1) }
+                .disabled(index == 0)
+            Button("Move Down") { moveManualItem(item.id, delta: 1) }
+                .disabled(index + 1 == appState.queueManager.upNextItems.count)
+        }
+
+        Divider()
+
+        Button(role: .destructive) {
+            appState.queueManager.remove(id: item.id)
+        } label: {
+            Label("Remove from Queue", systemImage: "minus.circle")
+        }
+    }
+
+    private func moveManualItem(_ id: UUID, delta: Int) {
+        let items = appState.queueManager.upNextItems
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              items.indices.contains(index + delta) else { return }
+        appState.queueManager.moveUpNextItem(id: id, onto: items[index + delta].id)
     }
 
     /// Delete selected items from the queue
     private func deleteSelectedItems() {
+        guard !selectedItemIds.isEmpty else { return }
         for id in selectedItemIds {
             appState.queueManager.remove(id: id)
         }
@@ -250,7 +305,8 @@ struct QueueView: View {
 
     /// Play the first selected item
     private func playFirstSelectedItem() {
-        guard let selectedId = selectedItemIds.first else { return }
+        guard let selectedId = appState.queueManager.allUpcoming
+            .first(where: { selectedItemIds.contains($0.id) })?.id else { return }
         Task {
             if let item = appState.queueManager.skipTo(id: selectedId) {
                 await appState.playbackManager.play(song: item.song)
@@ -319,6 +375,8 @@ struct QueueItemRow: View {
             }
         }
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(item.song.title), \(item.song.artist), \(item.song.formattedDuration)\(isCurrent ? ", now playing" : "")")
     }
 }
 

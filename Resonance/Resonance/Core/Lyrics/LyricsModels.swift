@@ -22,6 +22,18 @@ struct CachedLyrics: Codable, Sendable {
         source == .notFound
     }
 
+    /// Prefer synchronized text only when it contains content; some servers
+    /// return an empty synchronized field alongside valid plain lyrics.
+    var preferredLyricsText: String? {
+        for candidate in [syncedLyrics, plainLyrics] {
+            guard let candidate else { continue }
+            if !candidate.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return candidate
+            }
+        }
+        return nil
+    }
+
     /// Check if cache is still valid (not found entries expire after 24h)
     func isValid(ttl: TimeInterval = 86400) -> Bool {
         if isNotFound {

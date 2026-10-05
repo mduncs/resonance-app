@@ -223,12 +223,12 @@ struct ListenView: View {
                 .frame(height: 22)
 
             ListenActionButton("Lyrics", systemImage: "quote.bubble") {
-                appState.isLyricsPanelVisible.toggle()
+                appState.toggleNowPlayingInspector(.lyrics)
                 selectedPanel = .lyrics
             }
 
             ListenActionButton("Queue", systemImage: "music.note.list") {
-                appState.isQueueVisible.toggle()
+                appState.toggleNowPlayingInspector(.queue)
                 selectedPanel = .queue
             }
         }

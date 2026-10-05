@@ -38,9 +38,13 @@ struct AlbumArtView: View {
     // Pass actors directly to avoid Environment access in TableColumn closures
     var cacheActor: CacheActor?
     var networkActor: NetworkActor?
+    /// Optional presentation-only consumer of the image already loaded here.
+    /// Deriving a card backing must not trigger a second artwork request.
+    var onImageLoaded: ((NSImage?) -> Void)? = nil
 
     @State private var image: NSImage?
     @State private var isLoading = false
+    @State private var loadGeneration = UUID()
 
     private var frameSize: CGFloat? {
         flexible ? nil : size.pointSize
@@ -52,6 +56,9 @@ struct AlbumArtView: View {
 
     var body: some View {
         imageContent
+            .onChange(of: image) { _, loadedImage in
+                onImageLoaded?(loadedImage)
+            }
             .task(id: coverArtId) {
                 await loadImage()
             }
@@ -99,37 +106,42 @@ struct AlbumArtView: View {
     }
 
     private func loadImage() async {
+        guard !Task.isCancelled else { return }
+        let generation = UUID()
+        loadGeneration = generation
+        image = nil
+        isLoading = false
         guard let coverArtId, !coverArtId.isEmpty else { return }
         guard let cacheActor, let networkActor else { return }
 
-        // Fast path: check in-memory cache first (returns NSImage directly, no allocation)
-        if let cached = await cacheActor.getArtworkImage(for: coverArtId, size: size) {
-            await MainActor.run {
-                self.image = cached
-            }
-            return
+        isLoading = true
+        defer {
+            // An older request must not clear a newer request's loading state.
+            if loadGeneration == generation { isLoading = false }
         }
 
-        isLoading = true
-        defer { isLoading = false }
+        if let cached = await cacheActor.getArtworkImage(for: coverArtId, size: size) {
+            guard !Task.isCancelled, loadGeneration == generation else { return }
+            image = cached
+            return
+        }
+        guard !Task.isCancelled, loadGeneration == generation else { return }
 
-        // Fetch from server
         do {
             let data = try await networkActor.fetchCoverArt(
                 id: coverArtId,
                 size: Int(size.pointSize * 2) // 2x for Retina
             )
-            // Cache to disk and populate memory cache
+            guard !Task.isCancelled, loadGeneration == generation else { return }
             try? await cacheActor.cacheArtworkWithImage(data, for: coverArtId, size: size)
-            if let nsImage = NSImage(data: data) {
-                await MainActor.run {
-                    self.image = nsImage
-                }
-            }
+            guard !Task.isCancelled, loadGeneration == generation else { return }
+            image = NSImage(data: data)
         } catch {
-            // Silent failure - shows placeholder
+            // This request's image was cleared before loading: failed or absent
+            // artwork must not display the previous song's cover.
         }
     }
+
 }
 
 // MARK: - Environment Wrapper
@@ -140,6 +152,7 @@ struct EnvironmentAlbumArtView: View {
     let coverArtId: String?
     let size: ArtworkSize
     var flexible: Bool = false
+    var onImageLoaded: ((NSImage?) -> Void)? = nil
 
     @Environment(AppState.self) private var appState
 
@@ -149,7 +162,8 @@ struct EnvironmentAlbumArtView: View {
             size: size,
             flexible: flexible,
             cacheActor: appState.cacheActor,
-            networkActor: appState.networkActor
+            networkActor: appState.networkActor,
+            onImageLoaded: onImageLoaded
         )
     }
 }

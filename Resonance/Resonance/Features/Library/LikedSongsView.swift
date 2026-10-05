@@ -324,10 +324,14 @@ struct LikedSongsView: View {
 
     // MARK: - Helpers
 
-    private func relativeDate(_ date: Date) -> String {
+    private static let relativeDateFormatter: RelativeDateTimeFormatter = {
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .abbreviated
-        return formatter.localizedString(for: date, relativeTo: Date())
+        return formatter
+    }()
+
+    private func relativeDate(_ date: Date) -> String {
+        Self.relativeDateFormatter.localizedString(for: date, relativeTo: Date())
     }
 
     private func sortComparator(lhs: LikedSongRow, rhs: LikedSongRow) -> Bool {

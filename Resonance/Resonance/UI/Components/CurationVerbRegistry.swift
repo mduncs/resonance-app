@@ -12,6 +12,44 @@ struct CurationVerbContext {
 /// Result of performing a verb — `message` feeds toast confirmations.
 struct CurationVerbOutcome: Sendable, Equatable {
     let message: String?
+    let detail: String?
+    let style: CurationVerbFeedbackStyle
+    /// Whether the local mutation was persisted, even if an optional remote
+    /// sync failed. Quick Capture uses this to reconcile its optimistic label.
+    let localChangeApplied: Bool
+    /// The action completed for a server that is no longer active. Consumers
+    /// must not publish its feedback into the replacement server's UI.
+    let isStale: Bool
+
+    init(
+        message: String?,
+        detail: String? = nil,
+        style: CurationVerbFeedbackStyle = .success,
+        localChangeApplied: Bool = false,
+        isStale: Bool = false
+    ) {
+        self.message = message
+        self.detail = detail
+        self.style = style
+        self.localChangeApplied = localChangeApplied
+        self.isStale = isStale
+    }
+}
+
+enum CurationVerbFeedbackStyle: Sendable, Equatable {
+    case success
+    case info
+    case warning
+    case error
+
+    var appFeedbackStyle: FeedbackStyle {
+        switch self {
+        case .success: return .success
+        case .info: return .info
+        case .warning: return .warning
+        case .error: return .error
+        }
+    }
 }
 
 /// One curation verb: identity, presentation, availability, action.
@@ -210,13 +248,77 @@ enum CurationVerbRegistry {
                 keyHint: nil, isPrimary: false,
                 isAvailable: { $0.song != nil || $0.album != nil },
                 perform: { context in
-                    let songs = await resolvedSongs(context)
-                    guard !songs.isEmpty else { return CurationVerbOutcome(message: nil) }
-                    var favorited = false
-                    for song in songs {
-                        favorited = await toggleFavorite(song, context: context)
+                    guard let server = context.appState.activeServer else {
+                        return CurationVerbOutcome(
+                            message: "Connect to a server to update favorites",
+                            style: .warning
+                        )
                     }
-                    return CurationVerbOutcome(message: favorited ? "Favorited" : "Unfavorited")
+                    let serverId = server.id.uuidString
+                    let expectedServerID = server.id
+                    let songs = await resolvedSongs(context)
+                    guard context.appState.activeServer?.id == expectedServerID else {
+                        return CurationVerbOutcome(message: nil, isStale: true)
+                    }
+                    guard !songs.isEmpty else { return CurationVerbOutcome(message: nil) }
+
+                    var outcomes: [CurationVerbOutcome] = []
+                    for song in songs {
+                        let outcome = await toggleFavorite(
+                            song,
+                            context: context,
+                            serverId: serverId,
+                            expectedServerID: expectedServerID
+                        )
+                        if outcome.isStale { return outcome }
+                        outcomes.append(outcome)
+                    }
+
+                    let locallySaved = outcomes.filter { $0.message != nil }
+                    let localSaveFailures = outcomes.filter { $0.message == nil }
+                    guard !locallySaved.isEmpty else {
+                        return localSaveFailures.first ?? CurationVerbOutcome(message: nil)
+                    }
+
+                    let syncFailures = locallySaved.filter { $0.style == .warning }
+                    let localOnly = locallySaved.filter { $0.style == .info }
+                    if songs.count == 1, let outcome = outcomes.first {
+                        return outcome
+                    }
+
+                    var status: [String] = []
+                    if !localSaveFailures.isEmpty {
+                        status.append("\(localSaveFailures.count) couldn't be saved")
+                    }
+                    if !syncFailures.isEmpty {
+                        status.append("server sync failed for \(syncFailures.count) \(syncFailures.count == 1 ? "song" : "songs")")
+                    }
+                    if !localOnly.isEmpty, localOnly.count < songs.count {
+                        status.append("\(localOnly.count) saved locally only")
+                    }
+
+                    if !status.isEmpty {
+                        let syncDetail = syncFailures.compactMap(\.detail).first
+                        let localDetail = localSaveFailures.compactMap(\.detail).first
+                        let details = [localDetail, syncDetail].compactMap { $0 }
+                        return CurationVerbOutcome(
+                            message: "Saved \(locallySaved.count) of \(songs.count) favorites locally; " + status.joined(separator: "; "),
+                            detail: details.isEmpty ? nil : details.joined(separator: "\n"),
+                            style: syncFailures.isEmpty && localSaveFailures.isEmpty ? .info : .warning,
+                            localChangeApplied: !locallySaved.isEmpty
+                        )
+                    }
+                    if !localOnly.isEmpty {
+                        return CurationVerbOutcome(
+                            message: "Updated \(songs.count) favorites locally",
+                            style: .info,
+                            localChangeApplied: true
+                        )
+                    }
+                    return CurationVerbOutcome(
+                        message: "Updated \(songs.count) favorites",
+                        localChangeApplied: true
+                    )
                 }
             ),
             CurationVerb(
@@ -452,41 +554,94 @@ enum CurationVerbRegistry {
         }
     }
 
-    /// Toggle Favorite: local star (+ starred_at) then Navidrome sync — the full
-    /// `QuickCaptureMenu.toggleFavorite()` behavior. Returns the new state.
-    @discardableResult
-    static func toggleFavorite(_ song: Song, context: CurationVerbContext) async -> Bool {
+    /// Toggle Favorite: persist the local star first, then attempt the optional
+    /// Navidrome sync. A local write failure is a failure (never an in-memory
+    /// success); a sync failure preserves the valid local-first change.
+    static func toggleFavorite(
+        _ song: Song,
+        context: CurationVerbContext,
+        serverId: String,
+        expectedServerID: UUID
+    ) async -> CurationVerbOutcome {
         let appState = context.appState
         let date = Date()
 
-        var shouldFavorite = song.starred == nil
-        if let serverId = appState.activeServerId {
-            let starred = (try? appState.databaseManager
-                .loadStarredIds(type: "song", serverId: serverId)
-                .contains { $0.itemId == song.id }) ?? (song.starred != nil)
-            shouldFavorite = !starred
-            do {
-                try setFavoriteDB(song, shouldFavorite: shouldFavorite, serverId: serverId, database: appState.databaseManager, at: date)
-            } catch {
-                print("Failed to update quick capture favorite locally: \(error)")
-            }
+        guard appState.activeServer?.id == expectedServerID else {
+            return CurationVerbOutcome(message: nil, isStale: true)
         }
 
+        let isStarred: Bool
+        do {
+            isStarred = try appState.databaseManager
+                .loadStarredIds(type: "song", serverId: serverId)
+                .contains { $0.itemId == song.id }
+        } catch {
+            return CurationVerbOutcome(message: nil, detail: error.localizedDescription, style: .error)
+        }
+
+        let shouldFavorite = !isStarred
+        do {
+            try setFavoriteDB(
+                song,
+                shouldFavorite: shouldFavorite,
+                serverId: serverId,
+                database: appState.databaseManager,
+                at: date
+            )
+        } catch {
+            return CurationVerbOutcome(message: nil, detail: error.localizedDescription, style: .error)
+        }
+
+        // The local save is durable before publishing the in-memory change.
+        // This guard also prevents a result for a replaced server from being
+        // applied if this operation later gains an async step before here.
+        guard appState.activeServer?.id == expectedServerID else {
+            return CurationVerbOutcome(message: nil, isStale: true)
+        }
         appState.updateSongStarred(id: song.id, starred: shouldFavorite ? date : nil)
 
-        if appState.connectionStatus == .connected {
-            do {
-                if shouldFavorite {
-                    try await appState.networkActor.star(id: song.id, type: .song)
-                } else {
-                    try await appState.networkActor.unstar(id: song.id, type: .song)
-                }
-            } catch {
-                print("Failed to sync quick capture favorite: \(error)")
-            }
+        let localMessage = shouldFavorite ? "Favorited locally" : "Unfavorited locally"
+        guard appState.connectionStatus == .connected else {
+            return CurationVerbOutcome(message: localMessage, style: .info, localChangeApplied: true)
         }
 
-        return shouldFavorite
+        guard appState.activeServer?.id == expectedServerID else {
+            return CurationVerbOutcome(message: nil, isStale: true)
+        }
+
+        do {
+            if shouldFavorite {
+                try await appState.networkActor.star(
+                    id: song.id,
+                    type: .song,
+                    expectedServerID: expectedServerID
+                )
+            } else {
+                try await appState.networkActor.unstar(
+                    id: song.id,
+                    type: .song,
+                    expectedServerID: expectedServerID
+                )
+            }
+        } catch {
+            guard appState.activeServer?.id == expectedServerID else {
+                return CurationVerbOutcome(message: nil, isStale: true)
+            }
+            return CurationVerbOutcome(
+                message: "\(shouldFavorite ? "Favorited" : "Unfavorited") locally; server sync failed",
+                detail: error.localizedDescription,
+                style: .warning,
+                localChangeApplied: true
+            )
+        }
+
+        guard appState.activeServer?.id == expectedServerID else {
+            return CurationVerbOutcome(message: nil, isStale: true)
+        }
+        return CurationVerbOutcome(
+            message: shouldFavorite ? "Favorited" : "Unfavorited",
+            localChangeApplied: true
+        )
     }
 
     /// Later / Interesting: attention mark + waiting-room staging.

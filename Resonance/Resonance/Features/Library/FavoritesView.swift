@@ -396,20 +396,28 @@ private struct FavoriteAlbumsContent: View {
         ScrollView {
             LazyVGrid(columns: columns, spacing: 20) {
                 ForEach(albums) { album in
-                    AlbumCard(album: album)
-                        .onTapGesture {
+                    AlbumCardActionSurface(album: album) { artworkHoverChanged in
+                        Button {
                             selectedAlbum = album
+                        } label: {
+                            AlbumCard(
+                                album: album,
+                                showsHoverPlayButton: false,
+                                onArtworkHoverChange: artworkHoverChanged
+                            )
                         }
-                        .contextMenu {
-                            AlbumContextMenu(album: album)
-                        }
-                        .overlay(alignment: .topTrailing) {
-                            Image(systemName: "heart.fill")
-                                .foregroundStyle(.red)
-                                .font(.caption)
-                                .padding(6)
-                                .background(.ultraThinMaterial, in: Circle())
-                                .padding(4)
+                        .buttonStyle(.plain)
+                    }
+                    .contextMenu {
+                        AlbumContextMenu(album: album)
+                    }
+                    .overlay(alignment: .topTrailing) {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                            .padding(6)
+                            .background(.ultraThinMaterial, in: Circle())
+                            .padding(4)
                         }
                 }
             }

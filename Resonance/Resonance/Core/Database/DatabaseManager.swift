@@ -10,6 +10,17 @@ struct LikedSongRow: Identifiable, Sendable, Hashable {
     var id: String { song.id }
 }
 
+enum DatabaseManagerError: Error, LocalizedError, Sendable {
+    case fixtureSeedRequiresInjectedDatabase
+
+    var errorDescription: String? {
+        switch self {
+        case .fixtureSeedRequiresInjectedDatabase:
+            return "Parity fixture seeding requires an explicitly injected database path"
+        }
+    }
+}
+
 struct ProjectSongReferenceInsertResult: Sendable, Equatable {
     let requestedCount: Int
     let uniqueRequestedCount: Int
@@ -33,10 +44,11 @@ enum ProjectItemListenState {
     case marked
 }
 
-private extension Row {
+extension Row {
     func songFromCachedColumns(
         starredColumn: String = "starred_at",
-        ratingColumn: String = "rating"
+        ratingColumn: String = "rating",
+        releaseDateColumn: String = "release_date"
     ) -> Song {
         var song = Song(
             id: self["id"],
@@ -60,6 +72,10 @@ private extension Row {
         // Present only after the v6 migration; GRDB yields nil for an absent
         // column, so queries that don't select `path` stay unaffected.
         song.path = self["path"]
+        song.playCount = self["server_play_count"]
+        song.addedAt = self["server_added_at"]
+        song.releaseDate = MediaReleaseDate(storageValue: self[releaseDateColumn])
+        song.groupings = Song.decodeGroupings(self["groupings"])
         return song
     }
 
@@ -75,7 +91,9 @@ private extension Row {
             genre: self["genre"],
             coverArt: self["cover_art_id"],
             starred: self["starred_at"],
-            rating: self["rating"]
+            rating: self["rating"],
+            addedAt: self["added_at"],
+            releaseDate: MediaReleaseDate(storageValue: self["release_date"])
         )
     }
 
@@ -98,8 +116,13 @@ final class DatabaseManager: Sendable {
 
     /// Database file path (exposed for companion service IPC)
     let dbPath: String
+    /// True only when the caller explicitly supplied a database URL/path.
+    /// Fixture seeding is guarded by this bit and can therefore never target
+    /// the normal Application Support database by accident.
+    let isInjectedDatabase: Bool
+    var isFixtureDatabase: Bool { isInjectedDatabase }
 
-    init() throws {
+    convenience init() throws {
         let appSupport = FileManager.default.urls(
             for: .applicationSupportDirectory, in: .userDomainMask
         ).first!
@@ -107,15 +130,42 @@ final class DatabaseManager: Sendable {
             PublicDemoConfiguration.appSupportDirectoryName,
             isDirectory: true
         )
+        let path = dbDir.appendingPathComponent("resonance.db", isDirectory: false)
+        try self.init(databaseURL: path, injected: false)
+    }
 
-        // Create directory with restricted permissions
+    /// Open a caller-owned database URL. The production default above remains
+    /// byte-for-byte the same path and permissions as before this seam.
+    convenience init(databaseURL: URL) throws {
+        try self.init(databaseURL: databaseURL, injected: true)
+    }
+
+    /// Convenience spelling for fixture launchers that naturally hold a path.
+    convenience init(path: String) throws {
+        try self.init(databaseURL: URL(fileURLWithPath: path), injected: true)
+    }
+
+    convenience init(databasePath: String) throws {
+        try self.init(path: databasePath)
+    }
+
+    convenience init(fixtureDatabaseURL: URL) throws {
+        try self.init(databaseURL: fixtureDatabaseURL, injected: true)
+    }
+
+    private init(databaseURL: URL, injected: Bool) throws {
+        let path = databaseURL.path
+        let dbDir = databaseURL.deletingLastPathComponent()
+
+        // Create only the directory containing the requested database. This
+        // branch never resolves Application Support or reads production state.
         try FileManager.default.createDirectory(
             at: dbDir,
             withIntermediateDirectories: true,
             attributes: [.posixPermissions: 0o700]
         )
 
-        let path = dbDir.appendingPathComponent("resonance.db").path
+        self.isInjectedDatabase = injected
         self.dbPath = path
 
         var config = Configuration()
@@ -123,17 +173,44 @@ final class DatabaseManager: Sendable {
         config.prepareDatabase { db in
             // WAL mode for non-blocking reads during writes
             try db.execute(sql: "PRAGMA journal_mode = WAL")
+            db.add(function: DatabaseFunction(
+                "resonanceLocalizedStandardContains",
+                argumentCount: 2
+            ) { values in
+                guard let candidate = String.fromDatabaseValue(values[0]),
+                      let query = String.fromDatabaseValue(values[1]) else { return false }
+                return candidate.localizedStandardContains(query)
+            })
+            db.add(function: DatabaseFunction(
+                "resonanceAlbumTitleValid",
+                argumentCount: 1,
+                pure: true
+            ) { values in
+                guard let title = String.fromDatabaseValue(values[0]) else { return false }
+                return !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            })
+            db.add(function: DatabaseFunction(
+                "resonanceGroupingDisplay",
+                argumentCount: 1,
+                pure: true
+            ) { values in
+                let storage = String.fromDatabaseValue(values[0])
+                return (Song.decodeGroupings(storage) ?? [])
+                    .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                    .filter { !$0.isEmpty }
+                    .joined(separator: "; ")
+            })
         }
 
-        dbPool = try DatabasePool(path: path, configuration: config)
+        self.dbPool = try DatabasePool(path: path, configuration: config)
 
-        // Set file permissions after creation
+        // Fixture databases are scratch-owned, but keep the same restrictive
+        // mode as production so a capture cannot leave library data exposed.
         try FileManager.default.setAttributes(
             [.posixPermissions: 0o600],
             ofItemAtPath: path
         )
 
-        // Run migrations
         try migrator.migrate(dbPool)
     }
 
@@ -141,11 +218,8 @@ final class DatabaseManager: Sendable {
 
     private var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
-
-        #if DEBUG
-        // Speed up development by nuking db on schema change instead of crashing
-        migrator.eraseDatabaseOnSchemaChange = true
-        #endif
+        // Unknown migration identifiers can belong to a newer app build. Never
+        // erase the user's database automatically, including in DEBUG builds.
 
         migrator.registerMigration("v1-core") { db in
             // -- Cached library data (replaces SwiftData + JSON cache) --
@@ -583,7 +657,116 @@ final class DatabaseManager: Sendable {
             try Self.migrateSourceAttributionSongId(db)
         }
 
+        migrator.registerMigration("v10-album-added-at") { db in
+            try Self.migrateAlbumAddedAt(db)
+        }
+
+        migrator.registerMigration("v11-song-play-count") { db in
+            try Self.migrateSongPlayCount(db)
+        }
+
+        migrator.registerMigration("v12-song-added-at") { db in
+            try Self.migrateSongAddedAt(db)
+        }
+
+        migrator.registerMigration("v13-library-display-metadata") { db in
+            try Self.migrateLibraryDisplayMetadata(db)
+        }
+
+        // Fetcher exports can legitimately report one local file in several
+        // source collections.  Keep those server-scoped facts separately from
+        // the historical path-keyed table, whose primary key cannot represent
+        // that relationship without data loss.
+        migrator.registerMigration("v14-fetcher-attribution-facts") { db in
+            try db.create(table: "fetcher_source_attribution_facts") { t in
+                t.column("server_id", .text).notNull()
+                t.column("attribution_key", .text).notNull()
+                t.column("file_path", .text).notNull()
+                t.column("match_key", .text)
+                t.column("navidrome_song_id", .text)
+                t.column("source_collection_key", .text).notNull()
+                t.column("source_kind", .text)
+                t.column("source_display_name", .text)
+                t.column("download_source", .text)
+                t.column("query_context", .text)
+                t.column("acquired_at", .text)
+                t.column("imported_at", .text).notNull()
+                t.primaryKey(["server_id", "attribution_key"])
+            }
+            try db.create(index: "idx_fetcher_facts_song", on: "fetcher_source_attribution_facts", columns: ["server_id", "navidrome_song_id"])
+            try db.create(index: "idx_fetcher_facts_collection", on: "fetcher_source_attribution_facts", columns: ["server_id", "source_collection_key"])
+            try db.create(table: "fetcher_import_state") { t in
+                t.primaryKey("server_id", .text)
+                t.column("export_marker", .text)
+                t.column("last_error", .text)
+                t.column("updated_at", .text).notNull()
+            }
+        }
+
+        migrator.registerMigration("v15-fetcher-import-generations") { db in
+            try db.alter(table: "fetcher_import_state") { t in
+                t.add(column: "facts_marker", .text)
+                t.add(column: "facts_count", .integer)
+                t.add(column: "projection_marker", .text)
+                t.add(column: "projection_cache_generation", .text)
+            }
+        }
+        migrator.registerMigration("v16-fetcher-acquisition-song-links") { db in
+            try db.create(table: "fetcher_acquisition_song_links") { t in
+                t.column("server_id", .text).notNull(); t.column("attribution_key", .text).notNull()
+                t.column("navidrome_song_id", .text).notNull(); t.column("relative_path", .text)
+                t.column("resolution_method", .text); t.primaryKey(["server_id", "attribution_key", "navidrome_song_id"])
+            }
+            try db.create(index: "idx_fetcher_acquisition_song", on: "fetcher_acquisition_song_links", columns: ["server_id", "navidrome_song_id"])
+        }
+
+        // Projection may remain partially unresolved while the server cache is
+        // warming. Keep that diagnostic independent from the successful fact
+        // import marker so it remains visible without replaying 29k upserts.
+        migrator.registerMigration("v17-fetcher-projection-diagnostics") { db in
+            try db.alter(table: "fetcher_import_state") { t in
+                t.add(column: "projection_unresolved_count", .integer)
+                t.add(column: "projection_unresolved_kinds", .text)
+            }
+        }
+
+        migrator.registerMigration("v18-fetcher-link-completeness") { db in
+            try db.alter(table: "fetcher_import_state") { t in
+                t.add(column: "facts_link_count", .integer)
+            }
+        }
+
         return migrator
+    }
+
+    /// Nullable server metadata. Old rows stay unknown; no year/date invention.
+    static func migrateLibraryDisplayMetadata(_ db: Database) throws {
+        try db.alter(table: "cached_albums") { t in t.add(column: "release_date", .text) }
+        try db.alter(table: "cached_songs") { t in
+            t.add(column: "release_date", .text)
+            t.add(column: "groupings", .text)
+        }
+    }
+
+    /// Server metadata only; existing rows keep an unknown date with no local-time backfill.
+    static func migrateSongAddedAt(_ db: Database) throws {
+        try db.alter(table: "cached_songs") { t in
+            t.add(column: "server_added_at", .datetime)
+        }
+    }
+
+    /// No local-history backfill: server play counts are independently reported metadata.
+    static func migrateSongPlayCount(_ db: Database) throws {
+        try db.alter(table: "cached_songs") { t in
+            t.add(column: "server_play_count", .integer)
+        }
+    }
+
+    /// Nullable server metadata only: existing albums retain an unknown date.
+    static func migrateAlbumAddedAt(_ db: Database) throws {
+        try db.alter(table: "cached_albums") { t in
+            t.add(column: "added_at", .datetime)
+        }
     }
 
     /// Adds the exact identity published by the Fetcher v2 attribution
@@ -715,6 +898,269 @@ final class DatabaseManager: Sendable {
         try dbPool.write(block)
     }
 
+    // MARK: - Deterministic parity fixture
+
+    /// Seed a complete catalog into the explicitly injected fixture database.
+    ///
+    /// This method intentionally does not call the normal import/save helpers:
+    /// those helpers consult user defaults and production admission policy.
+    /// Every write here is scoped to the injected database and uses fixed
+    /// catalog timestamps, making repeated capture launches idempotent.
+    func seedFixtureCatalog(
+        _ catalog: ParityFixtureCatalog = .standard,
+        serverId: String? = nil
+    ) throws {
+        guard isInjectedDatabase else {
+            throw DatabaseManagerError.fixtureSeedRequiresInjectedDatabase
+        }
+
+        let fixtureServerId = serverId ?? catalog.serverId
+        let fixedDate = ParityFixtureCatalog.baseDate
+
+        try dbPool.write { db in
+            // Remove only this fixture server's rows. The guard above means
+            // this can never be the user's production database.
+            try db.execute(sql: "DELETE FROM smart_playlist_results WHERE playlist_id IN (SELECT id FROM smart_playlists WHERE server_id = ?)", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM smart_playlists WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM cached_playlist_songs WHERE playlist_id IN (SELECT id FROM cached_playlists WHERE server_id = ?)", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM cached_playlists WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM library_membership WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM liked_items WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM starred_items WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM attention_marks WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM hidden_items WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM waiting_room_items WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM play_history WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM discovered_albums WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM cached_songs WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM cached_albums WHERE server_id = ?", arguments: [fixtureServerId])
+            try db.execute(sql: "DELETE FROM cached_artists WHERE server_id = ?", arguments: [fixtureServerId])
+
+            for artist in catalog.artists {
+                try db.execute(
+                    sql: """
+                        INSERT INTO cached_artists
+                            (id, server_id, name, album_count, cover_art_id, starred_at, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [artist.id, fixtureServerId, artist.name, artist.albumCount, artist.coverArt, artist.starred, fixedDate]
+                )
+            }
+
+            for album in catalog.albums {
+                try db.execute(
+                    sql: """
+                        INSERT INTO cached_albums
+                            (id, server_id, name, artist_name, artist_id, song_count, duration,
+                             year, genre, cover_art_id, starred_at, rating, added_at, release_date, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        album.id, fixtureServerId, album.name, album.artist, album.artistId,
+                        album.songCount, album.duration, album.year, album.genre,
+                        album.coverArt, album.starred, album.rating, album.addedAt, album.releaseDate?.storageValue, fixedDate
+                    ]
+                )
+            }
+
+            for song in catalog.songs {
+                let matchKey = song.path.flatMap { PathMatchKey.canonical($0) }
+                try db.execute(
+                    sql: """
+                        INSERT INTO cached_songs
+                            (id, server_id, title, album_name, album_id, artist_name, artist_id,
+                             track, disc_number, year, genre, duration, bit_rate, content_type,
+                             suffix, cover_art_id, starred_at, rating, path, match_key, server_play_count, server_added_at, release_date, groupings, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        song.id, fixtureServerId, song.title, song.album, song.albumId,
+                        song.artist, song.artistId, song.track, song.discNumber, song.year,
+                        song.genre, song.duration, song.bitRate, song.contentType, song.suffix,
+                        song.coverArt, song.starred, song.rating, song.path, matchKey, song.playCount, song.addedAt, song.releaseDate?.storageValue, song.groupingsStorage, fixedDate
+                    ]
+                )
+            }
+
+            for playlist in catalog.playlists {
+                try db.execute(
+                    sql: """
+                        INSERT INTO cached_playlists
+                            (id, server_id, name, comment, owner, song_count, duration,
+                             created, changed, cover_art_id, is_public, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        playlist.id, fixtureServerId, playlist.name, playlist.comment,
+                        playlist.owner, playlist.songCount, playlist.duration, playlist.created,
+                        playlist.changed, playlist.coverArt, playlist.isPublic, fixedDate
+                    ]
+                )
+                for (position, songID) in catalog.playlistSongIDsByID[playlist.id, default: []].enumerated() {
+                    try db.execute(
+                        sql: "INSERT INTO cached_playlist_songs (playlist_id, song_id, position) VALUES (?, ?, ?)",
+                        arguments: [playlist.id, songID, position]
+                    )
+                }
+            }
+
+            for song in catalog.songs {
+                try db.execute(
+                    sql: """
+                        INSERT INTO library_membership
+                            (item_id, item_type, server_id, admitted_at, admitted_by, source_detail)
+                        VALUES (?, 'song', ?, ?, ?, ?)
+                        """,
+                    arguments: [song.id, fixtureServerId, fixedDate, LibraryAdmissionSource.manual.rawValue, "parity-atlas"]
+                )
+            }
+            for album in catalog.albums {
+                try db.execute(
+                    sql: """
+                        INSERT INTO library_membership
+                            (item_id, item_type, server_id, admitted_at, admitted_by, source_detail)
+                        VALUES (?, 'album', ?, ?, ?, ?)
+                        """,
+                    arguments: [album.id, fixtureServerId, fixedDate, LibraryAdmissionSource.manual.rawValue, "parity-atlas"]
+                )
+            }
+            for artist in catalog.artists {
+                try db.execute(
+                    sql: """
+                        INSERT INTO library_membership
+                            (item_id, item_type, server_id, admitted_at, admitted_by, source_detail)
+                        VALUES (?, 'artist', ?, ?, ?, ?)
+                        """,
+                    arguments: [artist.id, fixtureServerId, fixedDate, LibraryAdmissionSource.manual.rawValue, "parity-atlas"]
+                )
+            }
+
+            func insertMark(itemID: String, type: String, mark: String, date: Date, source: String) throws {
+                try db.execute(
+                    sql: "INSERT INTO attention_marks (item_id, item_type, server_id, mark_type, marked_at, source) VALUES (?, ?, ?, ?, ?, ?)",
+                    arguments: [itemID, type, fixtureServerId, mark, date, source]
+                )
+            }
+
+            for id in catalog.likedSongIDs { try insertMark(itemID: id, type: "song", mark: AttentionMarkType.liked.rawValue, date: fixedDate, source: "parity-atlas") }
+            for id in catalog.likedAlbumIDs { try insertMark(itemID: id, type: "album", mark: AttentionMarkType.liked.rawValue, date: fixedDate, source: "parity-atlas") }
+            for id in catalog.likedArtistIDs { try insertMark(itemID: id, type: "artist", mark: AttentionMarkType.liked.rawValue, date: fixedDate, source: "parity-atlas") }
+
+            for (index, id) in catalog.likedSongIDs.sorted().enumerated() {
+                try db.execute(
+                    sql: "INSERT INTO liked_items (item_id, item_type, server_id, liked_at, source) VALUES (?, 'song', ?, ?, ?)",
+                    arguments: [id, fixtureServerId, fixedDate.addingTimeInterval(-Double(index) * 3_600), "parity-atlas"]
+                )
+            }
+            for (index, id) in catalog.likedAlbumIDs.sorted().enumerated() {
+                try db.execute(
+                    sql: "INSERT INTO liked_items (item_id, item_type, server_id, liked_at, source) VALUES (?, 'album', ?, ?, ?)",
+                    arguments: [id, fixtureServerId, fixedDate.addingTimeInterval(-Double(index) * 7_200), "parity-atlas"]
+                )
+            }
+            for (index, id) in catalog.likedArtistIDs.sorted().enumerated() {
+                try db.execute(
+                    sql: "INSERT INTO liked_items (item_id, item_type, server_id, liked_at, source) VALUES (?, 'artist', ?, ?, ?)",
+                    arguments: [id, fixtureServerId, fixedDate.addingTimeInterval(-Double(index) * 10_800), "parity-atlas"]
+                )
+            }
+
+            for id in catalog.starredSongIDs {
+                let date = catalog.songByID[id]?.starred ?? fixedDate
+                try insertMark(itemID: id, type: "song", mark: AttentionMarkType.loved.rawValue, date: date, source: "parity-atlas")
+                try db.execute(
+                    sql: "INSERT INTO starred_items (item_id, item_type, server_id, starred_at) VALUES (?, 'song', ?, ?)",
+                    arguments: [id, fixtureServerId, date]
+                )
+            }
+            for id in catalog.starredAlbumIDs {
+                let date = catalog.albumByID[id]?.starred ?? fixedDate
+                try insertMark(itemID: id, type: "album", mark: AttentionMarkType.loved.rawValue, date: date, source: "parity-atlas")
+                try db.execute(
+                    sql: "INSERT INTO starred_items (item_id, item_type, server_id, starred_at) VALUES (?, 'album', ?, ?)",
+                    arguments: [id, fixtureServerId, date]
+                )
+            }
+            for id in catalog.starredArtistIDs {
+                let date = catalog.artistByID[id]?.starred ?? fixedDate
+                try insertMark(itemID: id, type: "artist", mark: AttentionMarkType.loved.rawValue, date: date, source: "parity-atlas")
+                try db.execute(
+                    sql: "INSERT INTO starred_items (item_id, item_type, server_id, starred_at) VALUES (?, 'artist', ?, ?)",
+                    arguments: [id, fixtureServerId, date]
+                )
+            }
+
+            for entry in catalog.playHistory {
+                guard let song = catalog.songByID[entry.songID] else { continue }
+                try db.execute(
+                    sql: """
+                        INSERT INTO play_history
+                            (song_id, server_id, played_at, duration_played, title, artist, album, album_id, cover_art)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        song.id, fixtureServerId, entry.playedAt, entry.durationPlayed,
+                        song.title, song.artist, song.album, song.albumId, song.coverArt
+                    ]
+                )
+            }
+
+            let encoder = JSONEncoder()
+            for playlist in catalog.smartPlaylists {
+                let rules = try encoder.encode(playlist.ruleGroup)
+                try db.execute(
+                    sql: """
+                        INSERT INTO smart_playlists
+                            (id, name, server_id, rules_json, sort_by, sort_order,
+                             item_limit, created_at, updated_at, last_evaluated)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                    arguments: [
+                        playlist.id, playlist.name, fixtureServerId, String(decoding: rules, as: UTF8.self),
+                        playlist.sortBy, playlist.sortOrder.rawValue, playlist.itemLimit,
+                        playlist.createdAt, playlist.updatedAt, playlist.lastEvaluated
+                    ]
+                )
+                for (position, songID) in catalog.smartPlaylistSongIDsByID[playlist.id, default: []].enumerated() {
+                    try db.execute(
+                        sql: "INSERT INTO smart_playlist_results (playlist_id, song_id, position) VALUES (?, ?, ?)",
+                        arguments: [playlist.id, songID, position]
+                    )
+                }
+            }
+
+            for album in catalog.albums {
+                try db.execute(
+                    sql: "INSERT INTO discovered_albums (album_id, server_id, discovered_at, source, is_seen) VALUES (?, ?, ?, ?, ?)",
+                    arguments: [album.id, fixtureServerId, fixedDate, "parity-atlas", false]
+                )
+            }
+        }
+    }
+
+    /// Compatibility aliases for launch wiring and focused tests.
+    func seedFixture(_ catalog: ParityFixtureCatalog = .standard, serverId: String? = nil) throws {
+        try seedFixtureCatalog(catalog, serverId: serverId)
+    }
+
+    func seedParityFixture(_ catalog: ParityFixtureCatalog = .standard, serverId: String? = nil) throws {
+        try seedFixtureCatalog(catalog, serverId: serverId)
+    }
+
+    func seedFixtureCatalog(
+        _ catalog: ParityFixtureCatalog = .standard,
+        serverID: String
+    ) throws {
+        try seedFixtureCatalog(catalog, serverId: serverID)
+    }
+
+    func seedFixtureCatalog(
+        catalog: ParityFixtureCatalog,
+        serverId: String? = nil
+    ) throws {
+        try seedFixtureCatalog(catalog, serverId: serverId)
+    }
+
     /// Shared by every cached-song insert so path persistence and join identity
     /// cannot drift apart when a song enters the cache through a different flow.
     private static func cachedSongPathValues(
@@ -730,13 +1176,13 @@ final class DatabaseManager: Sendable {
         let shouldAdmitImportedMedia = ImportPolicyDefaults.shouldAdmitImportedMedia()
 
         try dbPool.write { db in
-            for album in albums {
+            for album in AlbumSanitizer.sanitize(albums) {
                 try db.execute(
                     sql: """
                         INSERT INTO cached_albums
                             (id, server_id, name, artist_name, artist_id, song_count, duration,
-                             year, genre, cover_art_id, starred_at, rating, last_fetched)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             year, genre, cover_art_id, starred_at, rating, added_at, release_date, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             server_id = excluded.server_id,
                             name = excluded.name,
@@ -749,12 +1195,18 @@ final class DatabaseManager: Sendable {
                             cover_art_id = excluded.cover_art_id,
                             starred_at = excluded.starred_at,
                             rating = excluded.rating,
+                            added_at = CASE WHEN cached_albums.server_id = excluded.server_id
+                                THEN COALESCE(excluded.added_at, cached_albums.added_at)
+                                ELSE excluded.added_at END,
+                            release_date = CASE WHEN cached_albums.server_id = excluded.server_id
+                                THEN COALESCE(excluded.release_date, cached_albums.release_date)
+                                ELSE excluded.release_date END,
                             last_fetched = excluded.last_fetched
                         """,
                     arguments: [
                         album.id, serverId, album.name, album.artist, album.artistId,
                         album.songCount, album.duration, album.year, album.genre,
-                        album.coverArt, album.starred, album.rating, Date()
+                        album.coverArt, album.starred, album.rating, album.addedAt, album.releaseDate?.storageValue, Date()
                     ]
                 )
                 if shouldAdmitImportedMedia {
@@ -822,8 +1274,8 @@ final class DatabaseManager: Sendable {
                         INSERT INTO cached_songs
                             (id, server_id, title, album_name, album_id, artist_name, artist_id,
                              track, disc_number, year, genre, duration, bit_rate,
-                             content_type, suffix, cover_art_id, starred_at, rating, path, match_key, last_fetched)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                             content_type, suffix, cover_art_id, starred_at, rating, path, match_key, server_play_count, server_added_at, release_date, groupings, last_fetched)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         ON CONFLICT(id) DO UPDATE SET
                             server_id = excluded.server_id,
                             title = excluded.title,
@@ -842,6 +1294,22 @@ final class DatabaseManager: Sendable {
                             cover_art_id = excluded.cover_art_id,
                             starred_at = excluded.starred_at,
                             rating = excluded.rating,
+                            server_added_at = CASE
+                                WHEN cached_songs.server_id = excluded.server_id
+                                THEN COALESCE(excluded.server_added_at, cached_songs.server_added_at)
+                                ELSE excluded.server_added_at
+                            END,
+                            release_date = CASE WHEN cached_songs.server_id = excluded.server_id
+                                THEN COALESCE(excluded.release_date, cached_songs.release_date)
+                                ELSE excluded.release_date END,
+                            groupings = CASE WHEN cached_songs.server_id = excluded.server_id
+                                THEN COALESCE(excluded.groupings, cached_songs.groupings)
+                                ELSE excluded.groupings END,
+                            server_play_count = CASE
+                                WHEN cached_songs.server_id = excluded.server_id
+                                THEN COALESCE(excluded.server_play_count, cached_songs.server_play_count)
+                                ELSE excluded.server_play_count
+                            END,
                             path = COALESCE(excluded.path, cached_songs.path),
                             match_key = CASE
                                 WHEN excluded.path IS NOT NULL THEN excluded.match_key
@@ -854,7 +1322,7 @@ final class DatabaseManager: Sendable {
                         song.artist, song.artistId, song.track, song.discNumber,
                         song.year, song.genre, song.duration, song.bitRate,
                         song.contentType, song.suffix, song.coverArt, song.starred,
-                        song.rating, pathValues.path, pathValues.matchKey, Date()
+                        song.rating, pathValues.path, pathValues.matchKey, song.playCount, song.addedAt, song.releaseDate?.storageValue, song.groupingsStorage, Date()
                     ]
                 )
                 if shouldAdmitImportedMedia {
@@ -1077,7 +1545,9 @@ final class DatabaseManager: Sendable {
                     genre: row["genre"],
                     coverArt: row["cover_art_id"],
                     starred: row["starred_at"],
-                    rating: row["rating"]
+                    rating: row["rating"],
+                    addedAt: row["added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"])
                 )
             }
         }
@@ -1117,7 +1587,7 @@ final class DatabaseManager: Sendable {
 
     func loadCachedSong(id: String, serverId: String) throws -> Song? {
         try dbPool.read { db in
-            try Row.fetchOne(
+            return try Row.fetchOne(
                 db,
                 sql: "SELECT * FROM cached_songs WHERE id = ? AND server_id = ?",
                 arguments: [id, serverId]
@@ -1176,15 +1646,15 @@ final class DatabaseManager: Sendable {
                     INSERT OR IGNORE INTO cached_songs
                         (id, server_id, title, album_name, album_id, artist_name, artist_id,
                          track, disc_number, year, genre, duration, bit_rate,
-                         content_type, suffix, cover_art_id, starred_at, rating, path, match_key, last_fetched)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         content_type, suffix, cover_art_id, starred_at, rating, path, match_key, server_play_count, server_added_at, release_date, groupings, last_fetched)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     song.id, serverId, song.title, song.album, song.albumId,
                     song.artist, song.artistId, song.track, song.discNumber,
                     song.year, song.genre, song.duration, song.bitRate,
                     song.contentType, song.suffix, song.coverArt, song.starred,
-                    song.rating, pathValues.path, pathValues.matchKey, admittedAt
+                    song.rating, pathValues.path, pathValues.matchKey, song.playCount, song.addedAt, song.releaseDate?.storageValue, song.groupingsStorage, admittedAt
                 ]
             )
 
@@ -2070,15 +2540,15 @@ final class DatabaseManager: Sendable {
                     INSERT OR IGNORE INTO cached_songs
                         (id, server_id, title, album_name, album_id, artist_name, artist_id,
                          track, disc_number, year, genre, duration, bit_rate,
-                         content_type, suffix, cover_art_id, starred_at, rating, path, match_key, last_fetched)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         content_type, suffix, cover_art_id, starred_at, rating, path, match_key, server_play_count, server_added_at, release_date, groupings, last_fetched)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                 arguments: [
                     song.id, serverId, song.title, song.album, song.albumId,
                     song.artist, song.artistId, song.track, song.discNumber,
                     song.year, song.genre, song.duration, song.bitRate,
                     song.contentType, song.suffix, song.coverArt, song.starred,
-                    song.rating, pathValues.path, pathValues.matchKey, Date()
+                    song.rating, pathValues.path, pathValues.matchKey, song.playCount, song.addedAt, song.releaseDate?.storageValue, song.groupingsStorage, Date()
                 ]
             )
         }
@@ -2471,7 +2941,11 @@ final class DatabaseManager: Sendable {
                     genre: row["genre"], duration: row["duration"],
                     bitRate: row["bit_rate"], contentType: row["content_type"],
                     suffix: row["suffix"], coverArt: row["cover_art_id"],
-                    starred: row["starred_at"], rating: row["rating"]
+                    starred: row["starred_at"], rating: row["rating"],
+                    playCount: row["server_play_count"],
+                    addedAt: row["server_added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"]),
+                    groupings: Song.decodeGroupings(row["groupings"])
                 )
             }
         }
@@ -2497,7 +2971,9 @@ final class DatabaseManager: Sendable {
                     artistId: row["artist_id"], songCount: row["song_count"],
                     duration: row["duration"], year: row["year"], genre: row["genre"],
                     coverArt: row["cover_art_id"], starred: row["starred_at"],
-                    rating: row["rating"]
+                    rating: row["rating"],
+                    addedAt: row["added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"])
                 )
             }
         }
@@ -2816,7 +3292,11 @@ final class DatabaseManager: Sendable {
                         genre: row["genre"], duration: row["duration"],
                         bitRate: row["bit_rate"], contentType: row["content_type"],
                         suffix: row["suffix"], coverArt: row["cover_art_id"],
-                        starred: row["compatibility_starred_at"], rating: row["rating"]
+                        starred: row["compatibility_starred_at"], rating: row["rating"],
+                        playCount: row["server_play_count"],
+                        addedAt: row["server_added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"]),
+                    groupings: Song.decodeGroupings(row["groupings"])
                     ),
                     serverId: row["liked_server_id"],
                     source: row["source"],
@@ -2890,7 +3370,9 @@ final class DatabaseManager: Sendable {
                     artistId: row["artist_id"], songCount: row["song_count"],
                     duration: row["duration"], year: row["year"], genre: row["genre"],
                     coverArt: row["cover_art_id"], starred: row["starred_at"],
-                    rating: row["rating"]
+                    rating: row["rating"],
+                    addedAt: row["added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"])
                 )
             }
         }
@@ -3095,7 +3577,11 @@ final class DatabaseManager: Sendable {
                     genre: row["genre"], duration: row["duration"],
                     bitRate: row["bit_rate"], contentType: row["content_type"],
                     suffix: row["suffix"], coverArt: row["cover_art_id"],
-                    starred: row["starred_at"], rating: row["rating"]
+                    starred: row["starred_at"], rating: row["rating"],
+                    playCount: row["server_play_count"],
+                    addedAt: row["server_added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"]),
+                    groupings: Song.decodeGroupings(row["groupings"])
                 )
             }
         }
@@ -3152,7 +3638,9 @@ final class DatabaseManager: Sendable {
                     artistId: row["artist_id"], songCount: row["song_count"],
                     duration: row["duration"], year: row["year"], genre: row["genre"],
                     coverArt: row["cover_art_id"], starred: row["starred_at"],
-                    rating: row["rating"]
+                    rating: row["rating"],
+                    addedAt: row["added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"])
                 )
                 return (album: album, discoveredAt: row["discovered_at"] as Date, isSeen: row["is_seen"] as Bool)
             }
@@ -3224,7 +3712,9 @@ final class DatabaseManager: Sendable {
                     artistId: row["artist_id"], songCount: row["song_count"],
                     duration: row["duration"], year: row["year"], genre: row["genre"],
                     coverArt: row["cover_art_id"], starred: row["starred_at"],
-                    rating: row["rating"]
+                    rating: row["rating"],
+                    addedAt: row["added_at"],
+                    releaseDate: MediaReleaseDate(storageValue: row["release_date"])
                 )
                 return (
                     album: album,
@@ -3277,10 +3767,9 @@ final class DatabaseManager: Sendable {
         }
     }
 
-    /// Cache-side fallback source for the backfill. `cached_albums` has no true
-    /// added-at column (`last_fetched` is rewritten on every sync), so release
-    /// year is the closest honest recency proxy when the server's `newest` list
-    /// isn't reachable.
+    /// Cache-side fallback source for the legacy discovery backfill. This
+    /// release-year proxy is separate from optional server `added_at` metadata;
+    /// it must never be presented as or copied into an album addition date.
     func recentCachedAlbumIds(serverId: String, limit: Int) throws -> [String] {
         try dbPool.read { db in
             try String.fetchAll(
@@ -3468,13 +3957,221 @@ final class DatabaseManager: Sendable {
         }
     }
 
+    struct FetcherImportState: Sendable, Equatable {
+        let factsMarker: String?
+        let factsCount: Int?
+        let factsLinkCount: Int?
+        let projectionMarker: String?
+        let projectionCacheGeneration: String?
+        let projectionUnresolvedCount: Int?
+        let projectionUnresolvedKinds: [String: Int]
+    }
+
+    func fetcherImportState(serverId: String) throws -> FetcherImportState? {
+        try dbPool.read { db in
+            guard let row = try Row.fetchOne(db, sql: "SELECT facts_marker, facts_count, facts_link_count, projection_marker, projection_cache_generation, projection_unresolved_count, projection_unresolved_kinds FROM fetcher_import_state WHERE server_id = ?", arguments: [serverId]) else { return nil }
+            let encodedKinds: String? = row["projection_unresolved_kinds"]
+            let kinds = encodedKinds.flatMap { try? JSONDecoder().decode([String: Int].self, from: Data($0.utf8)) } ?? [:]
+            return FetcherImportState(factsMarker: row["facts_marker"], factsCount: row["facts_count"], factsLinkCount: row["facts_link_count"], projectionMarker: row["projection_marker"], projectionCacheGeneration: row["projection_cache_generation"], projectionUnresolvedCount: row["projection_unresolved_count"], projectionUnresolvedKinds: kinds)
+        }
+    }
+
+    func fetcherImportMarker(serverId: String) throws -> String? {
+        try fetcherImportState(serverId: serverId)?.projectionMarker
+    }
+
+    func hasFetcherAttributionFacts(serverId: String) throws -> Bool {
+        try dbPool.read { db in (try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM fetcher_source_attribution_facts WHERE server_id = ?", arguments: [serverId]) ?? 0) > 0 }
+    }
+
+    /// Lightweight diagnostics for the Sources screen and explicit import
+    /// rehearsals. These facts are scoped before counting so another server's
+    /// export cannot make this server look complete.
+    func fetcherAttributionFactCount(serverId: String) throws -> Int {
+        try dbPool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: "SELECT COUNT(*) FROM fetcher_source_attribution_facts WHERE server_id = ?",
+                arguments: [serverId]
+            ) ?? 0
+        }
+    }
+
+    func fetcherAttributionLinkCount(serverId: String) throws -> Int {
+        try dbPool.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM fetcher_acquisition_song_links WHERE server_id = ?", arguments: [serverId]) ?? 0
+        }
+    }
+
+    func fetcherResolvedAttributionFactCount(serverId: String) throws -> Int {
+        try dbPool.read { db in
+            try Int.fetchOne(
+                db,
+                sql: """
+                    SELECT COUNT(DISTINCT attribution_key)
+                    FROM fetcher_acquisition_song_links
+                    WHERE server_id = ?
+                    """,
+                arguments: [serverId]
+            ) ?? 0
+        }
+    }
+
+    /// Additive, server-scoped import.  No rows are deleted: Fetcher history and
+    /// user-curated projects must survive an export that is temporarily partial.
+    func upsertFetcherAttributionFacts(_ rows: [FetcherSourceAttribution], serverId: String) throws {
+        // Validate the complete publication before opening a write transaction.
+        // Skipping a bad row would make a partial import look permanently current.
+        func invalid(_ detail: String) -> FetcherContractLoaderError {
+            .inconsistentExport("invalid attribution facts: \(detail)")
+        }
+        guard !serverId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw invalid("empty server identity")
+        }
+        var acquisitionKeys = Set<String>()
+        for (index, row) in rows.enumerated() {
+            let key = row.attributionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty,
+                  !row.localPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  !row.sourceCollectionKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  (1...3).contains(row.contractVersion) else {
+                throw invalid("row \(index) has a missing identity/path/collection or unsupported version")
+            }
+            guard acquisitionKeys.insert(key).inserted else {
+                throw invalid("row \(index) repeats an acquisition identity")
+            }
+            if let scalar = row.navidromeSongId,
+               scalar.isEmpty || scalar != scalar.trimmingCharacters(in: .whitespacesAndNewlines) {
+                throw invalid("row \(index) has an invalid scalar song identity")
+            }
+            if let tracks = row.resolvedTracks {
+                var trackIDs = Set<String>()
+                for track in tracks {
+                    guard !track.navidromeSongId.isEmpty,
+                          track.navidromeSongId == track.navidromeSongId.trimmingCharacters(in: .whitespacesAndNewlines),
+                          trackIDs.insert(track.navidromeSongId).inserted else {
+                        throw invalid("row \(index) has an invalid or repeated track identity")
+                    }
+                    if let path = track.localFileRelativePath,
+                       path.isEmpty || path.hasPrefix("/") || path.split(separator: "/").contains("..") {
+                        throw invalid("row \(index) has an invalid relative track path")
+                    }
+                }
+                if let scalar = row.navidromeSongId,
+                   tracks.count != 1 || tracks.first?.navidromeSongId != scalar {
+                    throw invalid("row \(index) scalar disagrees with its exact track set")
+                }
+            }
+        }
+        let importedAt = ISO8601DateFormatter().string(from: Date())
+        try dbPool.write { db in
+            for row in rows {
+                let key = row.attributionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                let path = row.localPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                let collection = row.sourceCollectionKey.trimmingCharacters(in: .whitespacesAndNewlines)
+                try db.execute(sql: """
+                    INSERT INTO fetcher_source_attribution_facts
+                    (server_id, attribution_key, file_path, match_key, navidrome_song_id, source_collection_key, source_kind, source_display_name, download_source, query_context, acquired_at, imported_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(server_id, attribution_key) DO UPDATE SET
+                    file_path=excluded.file_path, match_key=excluded.match_key,
+                    navidrome_song_id=CASE
+                        WHEN excluded.navidrome_song_id IS NULL OR TRIM(excluded.navidrome_song_id) = ''
+                        THEN fetcher_source_attribution_facts.navidrome_song_id
+                        ELSE excluded.navidrome_song_id
+                    END,
+                    source_collection_key=excluded.source_collection_key, source_kind=excluded.source_kind,
+                    source_display_name=excluded.source_display_name, download_source=excluded.download_source,
+                    query_context=excluded.query_context, acquired_at=excluded.acquired_at, imported_at=excluded.imported_at
+                    """, arguments: [serverId, key, path, PathMatchKey.canonical(path), row.navidromeSongId,
+                                      collection, row.sourceKind, row.sourceDisplayName, row.downloadSource,
+                                      row.queryContext, row.acquiredAt, importedAt])
+                let tracks = row.resolvedTracks ?? row.navidromeSongId.map { [FetcherSourceAttribution.ResolvedTrack(navidromeSongId: $0, localFileRelativePath: nil, resolutionMethod: row.resolutionMethod)] } ?? []
+                for track in tracks where !track.navidromeSongId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    try db.execute(sql: """
+                        INSERT INTO fetcher_acquisition_song_links (server_id, attribution_key, navidrome_song_id, relative_path, resolution_method)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT(server_id, attribution_key, navidrome_song_id) DO UPDATE SET relative_path=excluded.relative_path, resolution_method=excluded.resolution_method
+                        """, arguments: [serverId, key, track.navidromeSongId, track.localFileRelativePath, track.resolutionMethod])
+                }
+            }
+        }
+    }
+
+    func recordFetcherImport(serverId: String, marker: String?, error: String?) throws {
+        try dbPool.write { db in
+            try db.execute(sql: """
+                INSERT INTO fetcher_import_state (server_id, export_marker, last_error, updated_at)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET export_marker=excluded.export_marker,
+                last_error=excluded.last_error, updated_at=excluded.updated_at
+                """, arguments: [serverId, marker, error, ISO8601DateFormatter().string(from: Date())])
+        }
+    }
+
+    func recordFetcherFacts(serverId: String, marker: String, count: Int, error: String?) throws {
+        try dbPool.write { db in
+            let linkCount = try Int.fetchOne(db, sql: "SELECT COUNT(*) FROM fetcher_acquisition_song_links WHERE server_id = ?", arguments: [serverId]) ?? 0
+            try db.execute(sql: """
+                INSERT INTO fetcher_import_state (server_id, facts_marker, facts_count, facts_link_count, last_error, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET facts_marker=excluded.facts_marker,
+                    facts_count=excluded.facts_count, facts_link_count=excluded.facts_link_count,
+                    last_error=excluded.last_error, updated_at=excluded.updated_at
+                """, arguments: [serverId, marker, count, linkCount, error, ISO8601DateFormatter().string(from: Date())])
+        }
+    }
+
+    func recordFetcherProjection(
+        serverId: String,
+        marker: String,
+        cacheGeneration: String,
+        unresolvedCount: Int = 0,
+        unresolvedKinds: [String: Int] = [:],
+        error: String?
+    ) throws {
+        let encodedKinds = String(data: try JSONEncoder().encode(unresolvedKinds), encoding: .utf8)
+        try dbPool.write { db in
+            try db.execute(sql: """
+                INSERT INTO fetcher_import_state (server_id, export_marker, projection_marker, projection_cache_generation, projection_unresolved_count, projection_unresolved_kinds, last_error, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(server_id) DO UPDATE SET export_marker=excluded.export_marker,
+                    projection_marker=excluded.projection_marker,
+                    projection_cache_generation=excluded.projection_cache_generation,
+                    projection_unresolved_count=excluded.projection_unresolved_count,
+                    projection_unresolved_kinds=excluded.projection_unresolved_kinds,
+                    last_error=excluded.last_error, updated_at=excluded.updated_at
+                """, arguments: [serverId, marker, marker, cacheGeneration, unresolvedCount, encodedKinds, error, ISO8601DateFormatter().string(from: Date())])
+        }
+    }
+
     /// Exact-match provenance lookup by stored absolute `file_path`.
-    func sourceAttribution(forPath path: String) throws -> SourceAttributionRecord? {
+    func sourceAttribution(forPath path: String, serverId: String? = nil) throws -> SourceAttributionRecord? {
         let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
         return try dbPool.read { db in
-            try Row.fetchOne(
+            // Facts are server-scoped. A path alone is not an identity across
+            // Navidrome servers, so an unscoped request intentionally falls
+            // through to the historical (unscoped) compatibility table rather
+            // than selecting an arbitrary server's fact.
+            if let serverId,
+               let fact = try Row.fetchOne(
+                    db,
+                    sql: """
+                        SELECT file_path, match_key, navidrome_song_id, attribution_key,
+                               source_collection_key, source_kind, source_display_name,
+                               download_source, query_context, acquired_at, imported_at
+                        FROM fetcher_source_attribution_facts
+                        WHERE file_path = ? AND server_id = ?
+                        ORDER BY acquired_at DESC, attribution_key
+                        LIMIT 1
+                        """,
+                    arguments: [trimmed, serverId]
+               ).map(SourceAttributionRecord.init(row:)) {
+                return fact
+            }
+            return try Row.fetchOne(
                 db,
                 sql: "SELECT * FROM source_attribution WHERE file_path = ?",
                 arguments: [trimmed]
@@ -3484,12 +4181,48 @@ final class DatabaseManager: Sendable {
 
     /// Primary provenance lookup. Fetcher v2 publishes Navidrome's
     /// `media_file.id`, which is byte-identical to `Song.id`.
-    func sourceAttribution(forSongId songId: String) throws -> SourceAttributionRecord? {
+    func sourceAttribution(forSongId songId: String, serverId: String? = nil) throws -> SourceAttributionRecord? {
         let trimmed = songId.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
 
         return try dbPool.read { db in
-            try Row.fetchOne(
+            // Same rule as the path lookup: server-scoped facts cannot be
+            // safely selected without the server identity.
+            if let serverId,
+               let fact = try Row.fetchOne(
+                    db,
+                    sql: """
+                        SELECT * FROM (
+                            SELECT facts.file_path, facts.match_key,
+                                   links.navidrome_song_id, facts.attribution_key,
+                                   facts.source_collection_key, facts.source_kind, facts.source_display_name,
+                                   facts.download_source, facts.query_context, facts.acquired_at, facts.imported_at
+                            FROM fetcher_source_attribution_facts AS facts
+                            JOIN fetcher_acquisition_song_links AS links
+                              ON links.server_id = facts.server_id
+                             AND links.attribution_key = facts.attribution_key
+                            WHERE links.navidrome_song_id = ? AND facts.server_id = ?
+                            UNION ALL
+                            SELECT facts.file_path, facts.match_key,
+                                   facts.navidrome_song_id, facts.attribution_key,
+                                   facts.source_collection_key, facts.source_kind, facts.source_display_name,
+                                   facts.download_source, facts.query_context, facts.acquired_at, facts.imported_at
+                            FROM fetcher_source_attribution_facts AS facts
+                            WHERE facts.navidrome_song_id = ? AND facts.server_id = ?
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM fetcher_acquisition_song_links AS links
+                                  WHERE links.server_id = facts.server_id
+                                    AND links.attribution_key = facts.attribution_key
+                              )
+                        )
+                        ORDER BY acquired_at DESC, file_path
+                        LIMIT 1
+                        """,
+                    arguments: [trimmed, serverId, trimmed, serverId]
+               ).map(SourceAttributionRecord.init(row:)) {
+                return fact
+            }
+            return try Row.fetchOne(
                 db,
                 sql: """
                     SELECT * FROM source_attribution
@@ -3564,7 +4297,7 @@ final class DatabaseManager: Sendable {
     /// Batch provenance lookup keyed by exact Navidrome song id. Song paths are
     /// deliberately ignored: Subsonic synthesizes them from tags and they do
     /// not identify Fetcher's local files.
-    func sourceAttributionsBySongId(songs: [Song]) throws -> [String: SourceAttributionRecord] {
+    func sourceAttributionsBySongId(songs: [Song], serverId: String? = nil) throws -> [String: SourceAttributionRecord] {
         let songIds = Array(Set(songs.compactMap { song -> String? in
             let trimmed = song.id.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
@@ -3574,6 +4307,42 @@ final class DatabaseManager: Sendable {
         return try dbPool.read { db in
             var result: [String: SourceAttributionRecord] = [:]
             try Self.forEachChunk(songIds) { chunk in
+                let facts = serverId == nil ? [] : try Row.fetchAll(
+                    db,
+                    sql: """
+                        SELECT * FROM (
+                            SELECT facts.file_path, facts.match_key,
+                                   links.navidrome_song_id, facts.attribution_key,
+                                   facts.source_collection_key, facts.source_kind, facts.source_display_name,
+                                   facts.download_source, facts.query_context, facts.acquired_at, facts.imported_at
+                            FROM fetcher_source_attribution_facts AS facts
+                            JOIN fetcher_acquisition_song_links AS links
+                              ON links.server_id = facts.server_id
+                             AND links.attribution_key = facts.attribution_key
+                            WHERE links.navidrome_song_id IN (\(Self.placeholders(chunk.count)))
+                              AND facts.server_id = ?
+                            UNION ALL
+                            SELECT facts.file_path, facts.match_key,
+                                   facts.navidrome_song_id, facts.attribution_key,
+                                   facts.source_collection_key, facts.source_kind, facts.source_display_name,
+                                   facts.download_source, facts.query_context, facts.acquired_at, facts.imported_at
+                            FROM fetcher_source_attribution_facts AS facts
+                            WHERE facts.navidrome_song_id IN (\(Self.placeholders(chunk.count)))
+                              AND facts.server_id = ?
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM fetcher_acquisition_song_links AS links
+                                  WHERE links.server_id = facts.server_id
+                                    AND links.attribution_key = facts.attribution_key
+                              )
+                        )
+                        ORDER BY navidrome_song_id, acquired_at DESC, file_path
+                        """,
+                    arguments: StatementArguments(Array(chunk) + [serverId!] + Array(chunk) + [serverId!])
+                ).map(SourceAttributionRecord.init(row:))
+                for row in facts {
+                    guard let songId = row.navidromeSongId, result[songId] == nil else { continue }
+                    result[songId] = row
+                }
                 let rows = try Row.fetchAll(
                     db,
                     sql: """
@@ -3605,17 +4374,57 @@ final class DatabaseManager: Sendable {
                 db,
                 sql: """
                     SELECT cached_songs.id AS song_id,
+                           facts.source_collection_key,
+                           facts.acquired_at,
+                           facts.file_path
+                    FROM cached_songs
+                    JOIN fetcher_acquisition_song_links AS links
+                      ON links.navidrome_song_id = cached_songs.id
+                     AND links.server_id = cached_songs.server_id
+                    JOIN fetcher_source_attribution_facts AS facts
+                      ON facts.server_id = links.server_id
+                     AND facts.attribution_key = links.attribution_key
+                    WHERE cached_songs.server_id = ?
+                      AND facts.source_collection_key != ''
+                    UNION ALL
+                    SELECT cached_songs.id AS song_id,
+                           facts.source_collection_key,
+                           facts.acquired_at,
+                           facts.file_path
+                    FROM cached_songs
+                    JOIN fetcher_source_attribution_facts AS facts
+                      ON facts.navidrome_song_id = cached_songs.id
+                     AND facts.server_id = cached_songs.server_id
+                    WHERE cached_songs.server_id = ?
+                      AND facts.source_collection_key != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM fetcher_acquisition_song_links AS links
+                          WHERE links.server_id = facts.server_id
+                            AND links.attribution_key = facts.attribution_key
+                      )
+                    UNION ALL
+                    SELECT cached_songs.id AS song_id,
                            source_attribution.source_collection_key,
                            source_attribution.acquired_at,
                            source_attribution.file_path
                     FROM cached_songs
-                    JOIN source_attribution
-                      ON source_attribution.navidrome_song_id = cached_songs.id
+                    JOIN source_attribution ON source_attribution.navidrome_song_id = cached_songs.id
                     WHERE cached_songs.server_id = ?
                       AND source_attribution.source_collection_key IS NOT NULL
                       AND source_attribution.source_collection_key != ''
+                      AND NOT EXISTS (
+                          SELECT 1 FROM fetcher_source_attribution_facts AS facts
+                          WHERE facts.server_id = cached_songs.server_id
+                            AND (
+                                facts.attribution_key = source_attribution.attribution_key
+                                OR (
+                                    facts.file_path = source_attribution.file_path
+                                    AND COALESCE(facts.source_collection_key, '') = COALESCE(source_attribution.source_collection_key, '')
+                                )
+                            )
+                      )
                     """,
-                arguments: [serverId]
+                arguments: [serverId, serverId, serverId]
             )
         }
         guard !rows.isEmpty else { return [:] }
@@ -3963,13 +4772,56 @@ final class DatabaseManager: Sendable {
                     db,
                     sql: """
                         SELECT cached_songs.album_id AS resolved_album_id,
-                               source_attribution.*
+                               facts.file_path, facts.match_key, links.navidrome_song_id,
+                               facts.attribution_key, facts.source_collection_key, facts.source_kind,
+                               facts.source_display_name, facts.download_source, facts.query_context,
+                               facts.acquired_at, facts.imported_at
                         FROM cached_songs
-                        JOIN source_attribution
-                          ON source_attribution.navidrome_song_id = cached_songs.id
+                        JOIN fetcher_acquisition_song_links AS links
+                          ON links.server_id = cached_songs.server_id
+                         AND links.navidrome_song_id = cached_songs.id
+                        JOIN fetcher_source_attribution_facts AS facts
+                          ON facts.server_id = links.server_id
+                         AND facts.attribution_key = links.attribution_key
                         WHERE cached_songs.album_id IN (\(Self.placeholders(chunk.count)))
+                        UNION ALL
+                        SELECT cached_songs.album_id AS resolved_album_id,
+                               facts.file_path, facts.match_key, facts.navidrome_song_id,
+                               facts.attribution_key, facts.source_collection_key, facts.source_kind,
+                               facts.source_display_name, facts.download_source, facts.query_context,
+                               facts.acquired_at, facts.imported_at
+                        FROM cached_songs
+                        JOIN fetcher_source_attribution_facts AS facts
+                          ON facts.server_id = cached_songs.server_id
+                         AND facts.navidrome_song_id = cached_songs.id
+                        WHERE cached_songs.album_id IN (\(Self.placeholders(chunk.count)))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM fetcher_acquisition_song_links AS links
+                              WHERE links.server_id = facts.server_id
+                                AND links.attribution_key = facts.attribution_key
+                          )
+                        UNION ALL
+                        SELECT cached_songs.album_id AS resolved_album_id,
+                               source_attribution.file_path, source_attribution.match_key, source_attribution.navidrome_song_id,
+                               source_attribution.attribution_key, source_attribution.source_collection_key, source_attribution.source_kind,
+                               source_attribution.source_display_name, source_attribution.download_source, source_attribution.query_context,
+                               source_attribution.acquired_at, source_attribution.imported_at
+                        FROM cached_songs
+                        JOIN source_attribution ON source_attribution.navidrome_song_id = cached_songs.id
+                        WHERE cached_songs.album_id IN (\(Self.placeholders(chunk.count)))
+                          AND NOT EXISTS (
+                              SELECT 1 FROM fetcher_source_attribution_facts AS facts
+                              WHERE facts.server_id = cached_songs.server_id
+                                AND (
+                                    facts.attribution_key = source_attribution.attribution_key
+                                    OR (
+                                        facts.file_path = source_attribution.file_path
+                                        AND COALESCE(facts.source_collection_key, '') = COALESCE(source_attribution.source_collection_key, '')
+                                    )
+                                )
+                          )
                         """,
-                    arguments: StatementArguments(chunk)
+                    arguments: StatementArguments(Array(chunk) + Array(chunk) + Array(chunk))
                 )
                 for row in rows {
                     let albumId: String = row["resolved_album_id"]
@@ -4224,7 +5076,7 @@ extension DatabaseManager {
             )
             return story
         }
-        story.attributionVoices = try songAttributionVoices(songId: songId, albumId: albumId)
+        story.attributionVoices = try songAttributionVoices(songId: songId, albumId: albumId, serverId: serverId)
         return story
     }
 
@@ -4396,9 +5248,10 @@ extension DatabaseManager {
     /// the album's exact-id voices.
     private func songAttributionVoices(
         songId: String,
-        albumId: String?
+        albumId: String?,
+        serverId: String
     ) throws -> [SourceAttributionRecord] {
-        if let attribution = try sourceAttribution(forSongId: songId) {
+        if let attribution = try sourceAttribution(forSongId: songId, serverId: serverId) {
             return [attribution]
         }
         if let albumId,

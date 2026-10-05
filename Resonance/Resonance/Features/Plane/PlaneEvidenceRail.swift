@@ -289,7 +289,7 @@ struct PlaneEvidenceRail: View {
 
     private func loadFetcherEvidence(for song: Song) {
         fetcherEvidence = []
-        guard UserDefaults.standard.bool(forKey: FetcherContractSettings.isEnabledKey),
+        guard FetcherContractSettings.isEnabled,
               let directory = FetcherContractLoader().configuredDirectory(),
               let snapshot = try? FetcherContractLoader().loadSnapshot(from: directory) else { return }
         fetcherEvidence = snapshot.songSourceEvidence(forNavidromeSongId: song.id)

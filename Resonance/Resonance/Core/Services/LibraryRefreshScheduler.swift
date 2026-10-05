@@ -5,39 +5,42 @@ import UserNotifications
 
 @MainActor
 struct LibraryRefreshExecutor {
-    struct Operations {
-        let fetchArtists: () async throws -> [Artist]
-        let fetchAlbums: () async throws -> AlbumLibraryFetchResult
-        let fetchSongs: (
+    struct Operations: Sendable {
+        let fetchArtists: @MainActor @Sendable () async throws -> [Artist]
+        let fetchAlbums: @MainActor @Sendable () async throws -> AlbumLibraryFetchResult
+        let fetchSongs: @MainActor @Sendable (
             _ onPage: @escaping @MainActor @Sendable ([Song]) async throws -> Void
         ) async throws -> SongLibraryFetchResult
-        let fetchStarred: () async throws -> StarredContent
+        let fetchStarred: @MainActor @Sendable () async throws -> StarredContent
+        /// Throws cancellation when the server/folder/configuration captured by
+        /// this refresh is no longer the active library origin.
+        let validateOrigin: @MainActor @Sendable () throws -> Void
 
-        let knownAlbumIds: () throws -> Set<String>
-        let saveArtists: ([Artist]) throws -> Void
-        let saveAlbums: ([Album]) throws -> Void
-        let saveSongs: ([Song]) throws -> Void
-        let syncStarred: (StarredContent) throws -> Void
-        let importLikedSongs: ([Song]) throws -> Int
+        let knownAlbumIds: @MainActor @Sendable () throws -> Set<String>
+        let saveArtists: @MainActor @Sendable ([Artist]) throws -> Void
+        let saveAlbums: @MainActor @Sendable ([Album]) throws -> Void
+        let saveSongs: @MainActor @Sendable ([Song]) throws -> Void
+        let syncStarred: @MainActor @Sendable (StarredContent) throws -> Void
+        let importLikedSongs: @MainActor @Sendable ([Song]) throws -> Int
 
-        let hiddenArtistIds: () throws -> Set<String>
-        let hiddenAlbumIds: () throws -> Set<String>
-        let admittedArtists: () throws -> [Artist]
-        let admittedAlbums: () throws -> [Album]
-        let refreshMembership: () -> Void
-        let refreshLikedIds: () -> Void
-        let applyArtists: ([Artist]) -> Void
-        let applyAlbums: ([Album]) -> Void
+        let hiddenArtistIds: @MainActor @Sendable () throws -> Set<String>
+        let hiddenAlbumIds: @MainActor @Sendable () throws -> Set<String>
+        let admittedArtists: @MainActor @Sendable () throws -> [Artist]
+        let admittedAlbums: @MainActor @Sendable () throws -> [Album]
+        let refreshMembership: @MainActor @Sendable () -> Void
+        let refreshLikedIds: @MainActor @Sendable () -> Void
+        let applyArtists: @MainActor @Sendable ([Artist]) -> Void
+        let applyAlbums: @MainActor @Sendable ([Album]) -> Void
 
         /// Generation sweep for one cached table. Receives the sync's start time;
         /// rows older than it were not returned by the server this sync.
-        let pruneStale: (DatabaseManager.PrunableLibraryItem, Date) throws -> DatabaseManager.LibraryPruneResult
+        let pruneStale: @MainActor @Sendable (DatabaseManager.PrunableLibraryItem, Date) throws -> DatabaseManager.LibraryPruneResult
 
-        let getMetadata: (String) throws -> String?
-        let setMetadata: (String, String) throws -> Void
-        let recordDiscoveredAlbums: ([String]) throws -> Void
-        let updateDiscoveryCount: () -> Void
-        let notifyNewAlbums: ([Album]) -> Void
+        let getMetadata: @MainActor @Sendable (String) throws -> String?
+        let setMetadata: @MainActor @Sendable (String, String) throws -> Void
+        let recordDiscoveredAlbums: @MainActor @Sendable ([String]) throws -> Void
+        let updateDiscoveryCount: @MainActor @Sendable () -> Void
+        let notifyNewAlbums: @MainActor @Sendable ([Album]) -> Void
     }
 
     struct Summary: Sendable {
@@ -50,6 +53,7 @@ struct LibraryRefreshExecutor {
         var pruneResults: [String: DatabaseManager.LibraryPruneResult] = [:]
     }
 
+    @MainActor
     private final class SongProgress {
         var persistedBatchCount = 0
         var persistedSongCount = 0
@@ -61,7 +65,7 @@ struct LibraryRefreshExecutor {
     }
 
     private static func captured<T: Sendable>(
-        _ operation: () async throws -> T
+        _ operation: @MainActor @Sendable () async throws -> T
     ) async -> Result<T, Error> {
         do {
             return .success(try await operation())
@@ -77,30 +81,43 @@ struct LibraryRefreshExecutor {
     ) async -> Summary {
         let songProgress = SongProgress()
 
-        let artistsTask = Task { @MainActor in
-            await captured(operations.fetchArtists)
-        }
-        let albumsTask = Task { @MainActor in
-            await captured(operations.fetchAlbums)
-        }
-        let songsTask = Task { @MainActor in
-            await captured {
-                try await operations.fetchSongs { songs in
-                    try operations.saveSongs(songs)
-                    songProgress.record(songs.count)
-                }
-            }
-        }
-        let starredTask = Task { @MainActor in
-            await captured(operations.fetchStarred)
+        do {
+            try operations.validateOrigin()
+        } catch {
+            return Summary(persistedLegs: [], failures: [:], songCount: 0)
         }
 
-        let (artistsFetch, albumsFetch, songsFetch, starredFetch) = await (
-            artistsTask.value,
-            albumsTask.value,
-            songsTask.value,
-            starredTask.value
+        async let artistsFetch = captured(operations.fetchArtists)
+        async let albumsFetch = captured(operations.fetchAlbums)
+        async let songsFetch = captured {
+            try await operations.fetchSongs { songs in
+                try operations.validateOrigin()
+                try operations.saveSongs(songs)
+                songProgress.record(songs.count)
+            }
+        }
+        async let starredFetch = captured(operations.fetchStarred)
+
+        let results = await (
+            artistsFetch,
+            albumsFetch,
+            songsFetch,
+            starredFetch
         )
+        let (artistsResult, albumsResult, songsResult, starredResult) = results
+
+        // No result from an obsolete or canceled refresh may mutate the cache,
+        // current UI, discovery ledger, sweep state, or last-sync metadata.
+        do {
+            try operations.validateOrigin()
+        } catch {
+            let persisted: Set<String> = songProgress.persistedBatchCount > 0 ? ["songs"] : []
+            return Summary(
+                persistedLegs: persisted,
+                failures: [:],
+                songCount: songProgress.persistedSongCount
+            )
+        }
 
         let timestamp = ISO8601DateFormatter().string(from: now)
         var persistedLegs = Set<String>()
@@ -108,6 +125,9 @@ struct LibraryRefreshExecutor {
         var songCount = songProgress.persistedSongCount
 
         func recordFailure(_ leg: String, _ error: Error) {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled {
+                return
+            }
             let description = error.localizedDescription
             failures[leg] = description
             let value = "\(timestamp) — \(description)"
@@ -149,7 +169,7 @@ struct LibraryRefreshExecutor {
         var albumWalk = LibraryWalkOutcome.truncated(reason: "albums leg did not complete")
         var songWalk = LibraryWalkOutcome.truncated(reason: "songs leg did not complete")
 
-        switch artistsFetch {
+        switch artistsResult {
         case .success(let artists):
             do {
                 try operations.saveArtists(artists)
@@ -164,9 +184,9 @@ struct LibraryRefreshExecutor {
             recordFailure("artists", error)
         }
 
-        switch albumsFetch {
+        switch albumsResult {
         case .success(let albumResult):
-            let albums = albumResult.albums
+            let albums = AlbumSanitizer.sanitize(albumResult.albums)
             albumWalk = albumResult.walk
             recordWalk("albums", albumResult.walk)
             do {
@@ -196,7 +216,7 @@ struct LibraryRefreshExecutor {
             recordFailure("albums", error)
         }
 
-        switch songsFetch {
+        switch songsResult {
         case .success(let result):
             songCount = result.songCount
             persistedLegs.insert("songs")
@@ -225,7 +245,7 @@ struct LibraryRefreshExecutor {
             recordFailure("songs", error)
         }
 
-        switch starredFetch {
+        switch starredResult {
         case .success(let starred):
             do {
                 try operations.saveSongs(starred.songs)
@@ -319,11 +339,17 @@ final class LibraryRefreshScheduler: ObservableObject {
     private weak var appState: AppState?
     private var timer: Timer?
     private var refreshTask: Task<Void, Never>?
+    private var refreshGeneration: UInt64 = 0
+    private var activeRefreshServerID: String?
+    private var activeRefreshUsesMinimumInterval = false
+    private var activeRefreshStartedAt: Date?
     private var cancellables = Set<AnyCancellable>()
     private var lastObservedConnection: (status: ConnectionStatus, serverId: String?)?
+    private var lastObservedOrigin: String?
     private var lastOneShotStartedAt: [String: Date] = [:]
     private let now: () -> Date
     private let connectionSnapshotOverride: (() -> (ConnectionStatus, String?))?
+    private let connectionOriginOverride: (() -> String?)?
     private let successfulSyncOverride: ((String) -> Bool)?
     private let refreshOverride: (() async -> Void)?
 
@@ -374,6 +400,7 @@ final class LibraryRefreshScheduler: ObservableObject {
         self.appState = appState
         self.now = Date.init
         self.connectionSnapshotOverride = nil
+        self.connectionOriginOverride = nil
         self.successfulSyncOverride = nil
         self.refreshOverride = nil
         Self.registerDefaults()
@@ -383,6 +410,7 @@ final class LibraryRefreshScheduler: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.rescheduleIfNeeded()
+                self?.connectionStateDidChange()
             }
             .store(in: &cancellables)
 
@@ -413,11 +441,13 @@ final class LibraryRefreshScheduler: ObservableObject {
     init(
         connectionSnapshot: @escaping () -> (ConnectionStatus, String?),
         successfulSyncExists: @escaping (String) -> Bool,
+        connectionOrigin: (() -> String?)? = nil,
         now: @escaping () -> Date = Date.init,
         refresh: @escaping () async -> Void
     ) {
         self.now = now
         self.connectionSnapshotOverride = connectionSnapshot
+        self.connectionOriginOverride = connectionOrigin
         self.successfulSyncOverride = successfulSyncExists
         self.refreshOverride = refresh
     }
@@ -425,8 +455,7 @@ final class LibraryRefreshScheduler: ObservableObject {
     func cleanup() {
         timer?.invalidate()
         timer = nil
-        refreshTask?.cancel()
-        refreshTask = nil
+        cancelActiveRefresh(restoringMinimumInterval: true)
     }
 
     // MARK: - Timer Management
@@ -518,13 +547,58 @@ final class LibraryRefreshScheduler: ObservableObject {
     func connectionStateDidChange() {
         let snapshot = connectionSnapshot()
         let previous = lastObservedConnection
+        let origin = connectionOriginFingerprint()
+        let previousOrigin = lastObservedOrigin
         lastObservedConnection = snapshot
+        lastObservedOrigin = origin
+
+        let originChanged = previous != nil && (
+            previous?.status != snapshot.0
+                || previous?.serverId != snapshot.1
+                || previousOrigin != origin
+        )
+        if originChanged {
+            cancelActiveRefresh(restoringMinimumInterval: true)
+        }
 
         guard snapshot.0 == .connected, let serverId = snapshot.1 else { return }
-        let isNewConnectedServer = previous?.status != .connected || previous?.serverId != serverId
-        guard isNewConnectedServer else { return }
+        let needsRefresh = previous?.status != .connected
+            || previous?.serverId != serverId
+            || previousOrigin != origin
+        guard needsRefresh else { return }
 
         requestRefresh(trigger: .connection)
+    }
+
+    private func connectionOriginFingerprint() -> String? {
+        if let connectionOriginOverride {
+            return connectionOriginOverride()
+        }
+        if connectionSnapshotOverride != nil {
+            return connectionSnapshot().1
+        }
+        guard let appState, let server = appState.activeServer else { return nil }
+        let folder = UserDefaults.standard.string(forKey: "libraryMusicFolderId") ?? ""
+        return "\(server.id.uuidString)|\(server.url.absoluteString)|\(server.username)|\(folder)"
+    }
+
+    private func cancelActiveRefresh(restoringMinimumInterval: Bool) {
+        if restoringMinimumInterval,
+           refreshTask != nil,
+           activeRefreshUsesMinimumInterval,
+           let serverID = activeRefreshServerID,
+           let startedAt = activeRefreshStartedAt,
+           lastOneShotStartedAt[serverID] == startedAt {
+            // A canceled connection bootstrap did not satisfy the debounce.
+            // Preserve timestamps only for attempts that actually completed.
+            lastOneShotStartedAt.removeValue(forKey: serverID)
+        }
+        refreshGeneration &+= 1
+        refreshTask?.cancel()
+        refreshTask = nil
+        activeRefreshServerID = nil
+        activeRefreshUsesMinimumInterval = false
+        activeRefreshStartedAt = nil
     }
 
     private func requestRefresh(trigger: RefreshTrigger) {
@@ -543,6 +617,11 @@ final class LibraryRefreshScheduler: ObservableObject {
             lastOneShotStartedAt[serverId] = startedAt
         }
 
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        activeRefreshServerID = serverId
+        activeRefreshUsesMinimumInterval = trigger.usesMinimumInterval
+        activeRefreshStartedAt = startedAt
         refreshTask = Task { @MainActor [weak self] in
             guard let self else { return }
             if let refreshOverride = self.refreshOverride {
@@ -550,7 +629,11 @@ final class LibraryRefreshScheduler: ObservableObject {
             } else {
                 await self.performRefresh()
             }
+            guard self.refreshGeneration == generation else { return }
             self.refreshTask = nil
+            self.activeRefreshServerID = nil
+            self.activeRefreshUsesMinimumInterval = false
+            self.activeRefreshStartedAt = nil
         }
     }
 
@@ -559,20 +642,53 @@ final class LibraryRefreshScheduler: ObservableObject {
 
         // Only refresh if connected
         guard appState.connectionStatus == ConnectionStatus.connected else { return }
-        guard let serverId = appState.activeServerId else { return }
+        guard let expectedServer = appState.activeServer else { return }
+        let serverId = expectedServer.id.uuidString
+        let configuredFolder = UserDefaults.standard.string(forKey: "libraryMusicFolderId") ?? ""
+        let expectedMusicFolderID = configuredFolder.isEmpty ? nil : configuredFolder
 
         let database = appState.databaseManager
         let network = appState.networkActor
+        let albumPresentationRevisionAtStart = appState.albumPresentationRevision
         let summary = await LibraryRefreshExecutor.run(
             serverId: serverId,
             now: now(),
             operations: .init(
-                fetchArtists: { try await network.fetchArtists() },
-                fetchAlbums: { try await network.fetchAllAlbums() },
-                fetchSongs: { onPage in
-                    try await network.fetchAllSongs(onPage: onPage)
+                fetchArtists: {
+                    try await network.fetchArtists(
+                        expectedServerID: expectedServer.id,
+                        expectedMusicFolderID: expectedMusicFolderID
+                    )
                 },
-                fetchStarred: { try await network.fetchStarred2() },
+                fetchAlbums: {
+                    try await network.fetchAllAlbums(
+                        expectedServerID: expectedServer.id,
+                        expectedMusicFolderID: expectedMusicFolderID
+                    )
+                },
+                fetchSongs: { onPage in
+                    try await network.fetchAllSongs(
+                        expectedServerID: expectedServer.id,
+                        expectedMusicFolderID: expectedMusicFolderID,
+                        onPage: onPage
+                    )
+                },
+                fetchStarred: {
+                    try await network.fetchStarred2(
+                        expectedServerID: expectedServer.id,
+                        expectedMusicFolderID: expectedMusicFolderID
+                    )
+                },
+                validateOrigin: {
+                    try Task.checkCancellation()
+                    let selectedFolder = UserDefaults.standard.string(forKey: "libraryMusicFolderId") ?? ""
+                    let activeFolder = selectedFolder.isEmpty ? nil : selectedFolder
+                    guard appState.connectionStatus == .connected,
+                          appState.activeServer == expectedServer,
+                          activeFolder == expectedMusicFolderID else {
+                        throw CancellationError()
+                    }
+                },
                 knownAlbumIds: { try database.knownAlbumIds(serverId: serverId) },
                 saveArtists: { try database.saveArtists($0, serverId: serverId) },
                 saveAlbums: { try database.saveAlbums($0, serverId: serverId) },
@@ -598,12 +714,17 @@ final class LibraryRefreshScheduler: ObservableObject {
                     try database.loadAdmittedArtists(serverId: serverId)
                 },
                 admittedAlbums: {
-                    try database.loadAdmittedAlbums(serverId: serverId)
+                    // The scheduler persists the complete network walk, but
+                    // publishing it into AppState would defeat demand-loading.
+                    []
                 },
                 refreshMembership: { appState.refreshLibraryMembershipIds() },
                 refreshLikedIds: { appState.refreshLikedIds() },
                 applyArtists: { appState.artists = $0 },
-                applyAlbums: { appState.albums = $0 },
+                applyAlbums: { _ in
+                    appState.reconcileAlbumPresentationOverrides(through: albumPresentationRevisionAtStart)
+                    appState.invalidateFullAlbumCatalog()
+                },
                 pruneStale: { item, syncStartedAt in
                     try database.pruneStaleLibraryRows(item, serverId: serverId, olderThan: syncStartedAt)
                 },
@@ -616,11 +737,42 @@ final class LibraryRefreshScheduler: ObservableObject {
                     appState.unseenDiscoveryCount = (try? database.unseenDiscoveryCount(serverId: serverId)) ?? 0
                 },
                 notifyNewAlbums: { [weak self] albums in
-                    guard UserDefaults.standard.bool(forKey: "showNewMusicNotifications") else { return }
+                    // Match Settings' enabled-by-default preference without overriding an explicit opt-out.
+                    guard (UserDefaults.standard.object(forKey: "showNewMusicNotifications") as? Bool) ?? true else { return }
                     self?.postNewMusicNotification(count: albums.count, albums: albums)
                 }
             )
         )
+
+        // Provenance facts are retried only after this origin has persisted its
+        // song cache, so exact Fetcher identities can resolve without guessing.
+        if summary.persistedLegs.contains("songs"),
+           FetcherContractSettings.isEnabled,
+           appState.activeServer == expectedServer,
+           let directory = FetcherContractLoader().configuredDirectory() {
+            let outcome = await FetcherProvenanceImporter.shared.importIfNeeded(
+                directory: directory, serverId: serverId, database: database
+            )
+            if case let .failed(message) = outcome {
+                print("[LibraryRefreshScheduler] Fetcher provenance import failed: \(message)")
+            }
+            if case let .awaitingSongCache(count, bySourceKind) = outcome {
+                let kinds = bySourceKind
+                    .sorted { $0.key.localizedStandardCompare($1.key) == .orderedAscending }
+                    .map { "\($0.key): \($0.value)" }
+                    .joined(separator: ", ")
+                print("[LibraryRefreshScheduler] Fetcher provenance awaiting \(count) exact mappings\(kinds.isEmpty ? "" : " (\(kinds))")")
+            }
+            guard appState.activeServer == expectedServer,
+                  FetcherContractSettings.isEnabled
+            else { return }
+            if case .imported = outcome {
+                NotificationCenter.default.post(name: .resonanceProjectItemsDidChange, object: nil, userInfo: ["serverId": serverId])
+            }
+            if case .awaitingSongCache = outcome {
+                NotificationCenter.default.post(name: .resonanceProjectItemsDidChange, object: nil, userInfo: ["serverId": serverId])
+            }
+        }
 
         print(
             "[LibraryRefreshScheduler] Refresh complete: "

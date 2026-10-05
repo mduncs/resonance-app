@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ArtistRow: View {
     let artist: Artist
+    var showsAlbumCount: Bool = true
 
     var body: some View {
         HStack(spacing: 12) {
@@ -15,9 +16,11 @@ struct ArtistRow: View {
                     .fontWeight(.medium)
                     .lineLimit(1)
 
-                Text("\(artist.albumCount) albums")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                if showsAlbumCount {
+                    Text("\(artist.albumCount) albums")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             Spacer()
@@ -52,6 +55,9 @@ struct ArtistImageView: View {
         }
         .clipShape(Circle())
         .task(id: coverArt) {
+            // Reused rows must show the placeholder immediately when artwork
+            // disappears or changes, not retain a previous artist's image.
+            image = nil
             await loadImage()
         }
     }
@@ -62,6 +68,7 @@ struct ArtistImageView: View {
         // Fast path: check in-memory cache first
         if let cached = await appState.cacheActor.getArtworkImage(for: coverArt, size: .small) {
             await MainActor.run {
+                guard !Task.isCancelled else { return }
                 self.image = cached
             }
             return
@@ -70,9 +77,11 @@ struct ArtistImageView: View {
         // Fetch from server
         do {
             let data = try await appState.networkActor.fetchCoverArt(id: coverArt, size: 100)
+            guard !Task.isCancelled else { return }
             try await appState.cacheActor.cacheArtworkWithImage(data, for: coverArt, size: .small)
             if let nsImage = NSImage(data: data) {
                 await MainActor.run {
+                    guard !Task.isCancelled else { return }
                     self.image = nsImage
                 }
             }

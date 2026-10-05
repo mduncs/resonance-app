@@ -153,6 +153,7 @@ struct GetInfoView: View {
 
             Spacer()
         }
+        .accessibilityElement(children: .combine)
     }
 
     private var fetcherEvidence: [FetcherSongSourceEvidence] {
@@ -186,11 +187,12 @@ struct GetInfoView: View {
     private func loadFetcherSnapshotIfNeeded() {
         fetcherSnapshot = nil
 
+        let loader = FetcherContractLoader()
         guard case .song = content,
-              UserDefaults.standard.bool(forKey: FetcherContractSettings.isEnabledKey),
-              let directory = FetcherContractLoader().configuredDirectory() else { return }
+              FetcherContractSettings.isEnabled,
+              let directory = loader.configuredDirectory() else { return }
 
-        fetcherSnapshot = try? FetcherContractLoader().loadSnapshot(from: directory)
+        fetcherSnapshot = try? loader.loadSnapshot(from: directory)
     }
 }
 
@@ -233,17 +235,19 @@ private struct SongInfoSection: View {
             InfoRow(label: "Content Type", value: song.contentType)
         }
 
-        Section("Library") {
-            if let rating = song.rating, rating > 0 {
-                InfoRow(label: "Rating", value: String(repeating: "\u{2605}", count: rating))
-            }
+        if hasLibraryMetadata {
+            Section("Library") {
+                if let rating = song.rating, rating > 0 {
+                    InfoRow(label: "Rating", value: String(repeating: "\u{2605}", count: rating))
+                }
 
-            if song.starred != nil {
-                InfoRow(label: "Loved", value: "Yes")
-            }
+                if song.starred != nil {
+                    InfoRow(label: "Loved", value: "Yes")
+                }
 
-            if song.isExplicit {
-                InfoRow(label: "Explicit", value: "Yes")
+                if song.isExplicit {
+                    InfoRow(label: "Explicit", value: "Yes")
+                }
             }
         }
 
@@ -263,6 +267,10 @@ private struct SongInfoSection: View {
                 }
             }
         }
+    }
+
+    private var hasLibraryMetadata: Bool {
+        (song.rating ?? 0) > 0 || song.starred != nil || song.isExplicit
     }
 
     private func hasReplayGainData(_ rg: ReplayGain) -> Bool {
@@ -356,16 +364,22 @@ private struct AlbumInfoSection: View {
             InfoRow(label: "Duration", value: formatDuration(album.duration))
         }
 
-        Section("Library") {
-            if let rating = album.rating, rating > 0 {
-                InfoRow(label: "Rating", value: String(repeating: "\u{2605}", count: rating))
-            }
+        if hasLibraryMetadata {
+            Section("Library") {
+                if let rating = album.rating, rating > 0 {
+                    InfoRow(label: "Rating", value: String(repeating: "\u{2605}", count: rating))
+                }
 
-            if album.starred != nil {
-                InfoRow(label: "Loved", value: "Yes")
+                if album.starred != nil {
+                    InfoRow(label: "Loved", value: "Yes")
+                }
             }
         }
     }
+    private var hasLibraryMetadata: Bool {
+        (album.rating ?? 0) > 0 || album.starred != nil
+    }
+
 
     private func formatDuration(_ seconds: Int) -> String {
         let hours = seconds / 3600
@@ -407,6 +421,7 @@ private struct PlaylistInfoSection: View {
         Section("Playlist Information") {
             InfoRow(label: "Name", value: playlist.name)
             InfoRow(label: "Owner", value: playlist.owner)
+            InfoRow(label: "Visibility", value: playlist.isPublic ? "Public" : "Private")
 
             if let comment = playlist.comment, !comment.isEmpty {
                 InfoRow(label: "Description", value: comment)
@@ -418,10 +433,9 @@ private struct PlaylistInfoSection: View {
             InfoRow(label: "Duration", value: playlist.formattedDuration)
         }
 
-        Section("Details") {
+        Section("Dates") {
             InfoRow(label: "Created", value: formatDate(playlist.created))
             InfoRow(label: "Modified", value: formatDate(playlist.changed))
-            InfoRow(label: "Visibility", value: playlist.isPublic ? "Public" : "Private")
         }
     }
 
@@ -583,5 +597,10 @@ private extension String {
 
 #Preview("Artist Info") {
     GetInfoView(content: .artist(.placeholder))
+        .environment(AppState())
+}
+
+#Preview("Playlist Info") {
+    GetInfoView(content: .playlist(.placeholder))
         .environment(AppState())
 }

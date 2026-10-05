@@ -60,6 +60,8 @@ targets:
       properties:
         LSApplicationCategoryType: public.app-category.music
         CFBundleDisplayName: Resonance
+        CFBundleShortVersionString: "1.1"
+        CFBundleVersion: "2"
         NSHumanReadableCopyright: "Copyright © 2026 mduncs. MIT licensed."
   ResonanceTests:
     type: bundle.unit-test

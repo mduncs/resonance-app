@@ -254,7 +254,7 @@ final class SourceVoicesTests: XCTestCase {
             sourceCollectionKey: collectionKey,
             sourceKind: "apple_playlist",
             sourceDisplayName: "Display \(key)",
-            downloadSource: "gamdl",
+            downloadSource: "fetcher",
             queryContext: "ctx",
             acquiredAt: acquiredAt,
             contractVersion: songId == nil ? 1 : 2,

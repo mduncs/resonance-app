@@ -95,6 +95,8 @@ struct FoldersView: View {
     @State private var isLoading = true
     @State private var error: ResonanceError?
     @State private var actionError: ResonanceError?
+    @State private var folderActionTask: Task<Void, Never>?
+    @State private var folderActionLifecycle = FolderBrowserActionLifecycle()
     @AppStorage("foldersRootLayoutStyle") private var layoutStyle: FolderLayoutStyle = .list
 
     var body: some View {
@@ -132,6 +134,22 @@ struct FoldersView: View {
             if let actionError {
                 ErrorBanner(error: actionError) {
                     self.actionError = nil
+                }
+                .padding(.horizontal, 24)
+                .padding(.bottom, 12)
+            }
+
+            if folderActionLifecycle.isBusy {
+                HStack(spacing: 10) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Preparing folder…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                    Button("Cancel", role: .cancel) {
+                        cancelFolderAction()
+                    }
+                    Spacer()
                 }
                 .padding(.horizontal, 24)
                 .padding(.bottom, 12)
@@ -205,6 +223,12 @@ struct FoldersView: View {
         .task {
             await loadMusicFolders()
         }
+        .onChange(of: appState.activeServerId) { _, _ in
+            cancelFolderAction()
+        }
+        .onDisappear {
+            cancelFolderAction()
+        }
     }
 
     private func loadMusicFolders() async {
@@ -225,17 +249,13 @@ struct FoldersView: View {
     @ViewBuilder
     private func folderContextMenu(for folder: MusicFolder) -> some View {
         Button {
-            Task {
-                await play(folder)
-            }
+            beginFolderAction(folder, action: .play)
         } label: {
             Label("Play", systemImage: "play.fill")
         }
 
         Button {
-            Task {
-                await play(folder, shuffled: true)
-            }
+            beginFolderAction(folder, action: .shuffle)
         } label: {
             Label("Shuffle", systemImage: "shuffle")
         }
@@ -243,83 +263,71 @@ struct FoldersView: View {
         Divider()
 
         Button {
-            Task {
-                await addToQueue(folder)
-            }
+            beginFolderAction(folder, action: .queue)
         } label: {
             Label("Add to Queue", systemImage: "text.badge.plus")
         }
 
         Button {
-            Task {
-                await download(folder)
-            }
+            beginFolderAction(folder, action: .download)
         } label: {
             Label("Download", systemImage: "arrow.down.circle")
         }
     }
 
-    private func play(_ folder: MusicFolder, shuffled: Bool = false) async {
-        do {
-            actionError = nil
-            var songs = try await FolderTraversalService.fetchVisibleSongs(
-                in: folder,
-                using: appState.networkActor,
-                hiddenSongIds: appState.hiddenSongIds
-            )
-            guard !songs.isEmpty else { return }
-            if shuffled {
-                songs.shuffle()
+    private enum FolderAction { case play, shuffle, queue, download }
+
+    private func beginFolderAction(_ folder: MusicFolder, action: FolderAction) {
+        folderActionTask?.cancel()
+        let generation = folderActionLifecycle.begin()
+        let serverID = appState.activeServerId
+        actionError = nil
+
+        folderActionTask = Task {
+            do {
+                let songs = try await FolderTraversalService.fetchVisibleSongs(
+                    in: folder,
+                    using: appState.networkActor,
+                    hiddenSongIds: appState.hiddenSongIds
+                )
+                guard isFolderActionCurrent(generation, serverID: serverID) else { return }
+                switch action {
+                case .play:
+                    await appState.playbackManager.play(songs: songs)
+                case .shuffle:
+                    await appState.playbackManager.play(songs: songs.shuffled())
+                case .queue:
+                    appState.playbackManager.addToQueue(songs)
+                case .download:
+                    guard let server = await appState.networkActor.activeServer,
+                          server.id.uuidString == serverID else { return }
+                    await appState.cacheActor.queueDownloads(songs: songs, serverId: server.id)
+                }
+                guard isFolderActionCurrent(generation, serverID: serverID) else { return }
+                folderActionLifecycle.finish(generation)
+            } catch is CancellationError {
+                guard isFolderActionCurrent(generation, serverID: serverID) else { return }
+                folderActionLifecycle.finish(generation)
+            } catch let error as ResonanceError {
+                guard isFolderActionCurrent(generation, serverID: serverID) else { return }
+                actionError = error
+                folderActionLifecycle.finish(generation)
+            } catch {
+                guard isFolderActionCurrent(generation, serverID: serverID) else { return }
+                actionError = .networkError(error)
+                folderActionLifecycle.finish(generation)
             }
-            await appState.playbackManager.play(songs: songs)
-        } catch is CancellationError {
-            return
-        } catch let error as ResonanceError {
-            actionError = error
-        } catch {
-            actionError = .networkError(error)
         }
     }
 
-    private func addToQueue(_ folder: MusicFolder) async {
-        do {
-            actionError = nil
-            let songs = try await FolderTraversalService.fetchVisibleSongs(
-                in: folder,
-                using: appState.networkActor,
-                hiddenSongIds: appState.hiddenSongIds
-            )
-            appState.playbackManager.addToQueue(songs)
-        } catch is CancellationError {
-            return
-        } catch let error as ResonanceError {
-            actionError = error
-        } catch {
-            actionError = .networkError(error)
-        }
+    private func isFolderActionCurrent(_ generation: Int, serverID: String?) -> Bool {
+        !Task.isCancelled && folderActionLifecycle.isCurrent(generation) && appState.activeServerId == serverID
     }
 
-    private func download(_ folder: MusicFolder) async {
-        guard let server = await appState.networkActor.activeServer else {
-            actionError = .notConfigured
-            return
-        }
-
-        do {
-            actionError = nil
-            let songs = try await FolderTraversalService.fetchVisibleSongs(
-                in: folder,
-                using: appState.networkActor,
-                hiddenSongIds: appState.hiddenSongIds
-            )
-            await appState.cacheActor.queueDownloads(songs: songs, serverId: server.id)
-        } catch is CancellationError {
-            return
-        } catch let error as ResonanceError {
-            actionError = error
-        } catch {
-            actionError = .networkError(error)
-        }
+    private func cancelFolderAction() {
+        folderActionTask?.cancel()
+        folderActionTask = nil
+        folderActionLifecycle.cancel()
     }
 }
 

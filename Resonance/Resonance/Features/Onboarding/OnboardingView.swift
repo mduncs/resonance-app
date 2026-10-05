@@ -194,9 +194,9 @@ struct WelcomePage: View {
             Spacer()
 
             VStack(spacing: 12) {
-                FeatureRow(icon: "waveform", title: "High Quality Audio", description: "Gapless playback with 10-band EQ")
+                FeatureRow(icon: "waveform", title: "High Quality Audio", description: "Gapless playback with optional ReplayGain normalization")
                 FeatureRow(icon: "arrow.down.circle", title: "Offline Support", description: "Download your favorites for offline listening")
-                FeatureRow(icon: "text.quote", title: "Lyrics", description: "Synced lyrics from your library and LRCLIB")
+                FeatureRow(icon: "text.quote", title: "Lyrics", description: "Synced lyrics from your library")
             }
             .padding()
 

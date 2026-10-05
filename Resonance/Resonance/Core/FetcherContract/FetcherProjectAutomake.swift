@@ -102,6 +102,10 @@ enum FetcherProjectAutomake {
         var addedSongCount = 0
         var skippedArchivedCount = 0
         var unresolvedCollectionCount = 0
+        /// Diagnostics only: room exports currently map directory paths rather
+        /// than exact Navidrome song ids, so they remain retryable instead of
+        /// being guessed into projects.
+        var unresolvedCollectionCountsBySourceKind: [String: Int] = [:]
 
         var didChangeAnything: Bool {
             !createdProjectIds.isEmpty || !updatedProjectIds.isEmpty || addedSongCount > 0
@@ -118,11 +122,27 @@ enum FetcherProjectAutomake {
         serverId: String,
         database: DatabaseManager
     ) throws -> Summary {
+        try run(collections: snapshot.sourceCollections, serverId: serverId, database: database)
+    }
+
+    /// Background provenance import reads only collection metadata and facts;
+    /// keep automake usable without decoding the inspector's larger export.
+    static func run(
+        collections: [FetcherSourceCollection],
+        serverId: String,
+        database: DatabaseManager
+    ) throws -> Summary {
         var summary = Summary()
 
         let songsByCollection = try database.songIdsBySourceCollectionKey(serverId: serverId)
         guard !songsByCollection.isEmpty else {
-            summary.unresolvedCollectionCount = snapshot.sourceCollections.filter(isEligible).count
+            let unresolved = collections.filter(isEligible)
+            summary.unresolvedCollectionCount = unresolved.count
+            for collection in unresolved {
+                summary.unresolvedCollectionCountsBySourceKind[
+                    diagnosticSourceKind(collection), default: 0
+                ] += 1
+            }
             return summary
         }
 
@@ -132,11 +152,14 @@ enum FetcherProjectAutomake {
             uniquingKeysWith: { first, _ in first }
         )
 
-        for collection in snapshot.sourceCollections where isEligible(collection) {
+        for collection in collections where isEligible(collection) {
             guard let songIds = songsByCollection[collection.sourceCollectionKey],
                   !songIds.isEmpty
             else {
                 summary.unresolvedCollectionCount += 1
+                summary.unresolvedCollectionCountsBySourceKind[
+                    diagnosticSourceKind(collection), default: 0
+                ] += 1
                 continue
             }
 
@@ -194,5 +217,10 @@ enum FetcherProjectAutomake {
         }
 
         return summary
+    }
+
+    private static func diagnosticSourceKind(_ collection: FetcherSourceCollection) -> String {
+        let kind = collection.sourceKind.trimmingCharacters(in: .whitespacesAndNewlines)
+        return kind.isEmpty ? "unknown" : kind
     }
 }

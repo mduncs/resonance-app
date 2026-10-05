@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 
 // MARK: - Sequence Extension
 
@@ -14,17 +15,57 @@ private extension Sequence where Element: Hashable {
 
 struct AlbumDetailView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let album: Album
 
     @State private var songs: [Song] = []
     @State private var viewState: ViewState = .loading
     @State private var moreByArtist: [Album] = []
     @State private var isLoadingMore = false
+    @State private var moreByArtistError: ResonanceError?
+    @State private var songsLoadGeneration = UUID()
+    @State private var moreLoadGeneration = UUID()
+    @State private var loadRetry = 0
+    @State private var presentationState: AlbumDetailPresentationState
+
+    private struct PointMetadataKey: Hashable {
+        let serverID: String?
+        let albumID: String
+        let libraryRevision: UInt64
+    }
+
+    private var pointMetadataKey: PointMetadataKey {
+        PointMetadataKey(serverID: appState.activeServerId, albumID: album.id,
+                         libraryRevision: appState.libraryMembershipRevision)
+    }
+
+    private var displayedAlbum: Album {
+        _ = appState.albumPresentationRevision
+        return presentationState.displayed(using: appState.albumPresentationStore)
+    }
+
+    private var isStarred: Bool { displayedAlbum.starred != nil }
+
+    private struct LoadIdentity: Equatable {
+        let serverId: String?
+        let albumId: String
+        let artistId: String
+        let retry: Int
+    }
+
+    private var loadIdentity: LoadIdentity {
+        LoadIdentity(serverId: appState.activeServerId, albumId: album.id,
+                     artistId: displayedAlbum.artistId, retry: loadRetry)
+    }
     @State private var selectedArtist: Artist?
+    @State private var artistNavigationTask: Task<Void, Never>?
     @State private var selectedGenre: String?
-    @State private var isStarred: Bool
     @State private var cachedSongsByDisc: [(disc: Int, songs: [Song])] = []
     @State private var searchText: String = ""
+    @State private var trackSelection = OrderedItemSelection<String>()
+    @State private var displayedTrackIDs: [String] = []
+    @State private var selectedTrackSongs: [Song] = []
+    @State private var playbackIndexByTrackID: [String: Int] = [:]
     /// Captured on init to persist highlight even after AppState clears it
     @State private var highlightSongId: String?
 
@@ -47,7 +88,7 @@ struct AlbumDetailView: View {
 
     init(album: Album) {
         self.album = album
-        self._isStarred = State(initialValue: album.starred != nil)
+        self._presentationState = State(initialValue: AlbumDetailPresentationState(navigation: album))
     }
 
     /// Current song ID from playback for highlighting
@@ -61,8 +102,9 @@ struct AlbumDetailView: View {
     }
 
     private func updateSongsByDisc() {
-        let grouped = Dictionary(grouping: songs) { $0.discNumber ?? 1 }
-        cachedSongsByDisc = grouped.keys.sorted().map { (disc: $0, songs: grouped[$0]!) }
+        let grouped = Dictionary(grouping: songs) { $0.effectiveAlbumDiscNumber }
+        cachedSongsByDisc = grouped.keys.sorted().map { (disc: $0, songs: grouped[$0]!.sortedForAlbum()) }
+        refreshTrackProjection()
     }
 
     /// Whether to show disc separators (only if multiple discs)
@@ -90,7 +132,7 @@ struct AlbumDetailView: View {
                 VStack(spacing: 0) {
                     // Header
                     AlbumHeaderView(
-                    album: album,
+                    album: displayedAlbum,
                     songs: songs,
                     isStarred: isStarred,
                     onPlay: {
@@ -119,7 +161,7 @@ struct AlbumDetailView: View {
                 if !isAlbumAdmitted {
                     ReleaseShadowBanner(
                         title: "Release Shadow",
-                        detail: "\(album.name) is outside Library",
+                        detail: "\(displayedAlbum.name) is outside Library",
                         actionTitle: "Admit"
                     ) {
                         Task {
@@ -129,9 +171,6 @@ struct AlbumDetailView: View {
                     .padding(.horizontal)
                     .padding(.bottom, 12)
                 }
-
-                Divider()
-                    .padding(.horizontal)
 
                 // Track list
                 switch viewState {
@@ -151,15 +190,15 @@ struct AlbumDetailView: View {
                         actionTitle: "Retry",
                         actionSystemImage: "arrow.clockwise"
                     ) {
-                        Task { await loadSongs() }
+                        loadRetry += 1
                     }
                     .padding(.horizontal)
 
                 case .populated:
                     trackListView
-                        .padding(.horizontal)
+                        .padding(.trailing, NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay))
 
-                    // Credits section (if we have songwriter/composer info from songs)
+                    // Available release metadata and track summary
                     creditsSection
 
                     // More by Artist section
@@ -171,16 +210,24 @@ struct AlbumDetailView: View {
             // Scroll to highlighted song after songs load
             if case .populated = newState, let songId = highlightSongId {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                    withAnimation(.easeInOut(duration: 0.3)) {
+                    withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.3)) {
                         proxy.scrollTo(songId, anchor: .center)
                     }
                 }
             }
         }
+        .onChange(of: trackSelection.focusedID) { _, id in
+            guard let id else { return }
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
+                proxy.scrollTo(id, anchor: .center)
+            }
         }
-        .navigationTitle(album.name)
+        }
+        .navigationTitle(displayedAlbum.name)
         .searchable(text: $searchText, prompt: "Find in Album")
+        .background(LibrarySearchFieldMetrics().frame(width: 0, height: 0))
         .toolbar {
+            ToolbarItem(placement: .principal) { Spacer() }
             // .primaryAction keeps these trailing; without an explicit placement
             // .automatic drops them next to the back chevron, where they read as
             // a second transport cluster competing with the floating bar.
@@ -220,25 +267,42 @@ struct AlbumDetailView: View {
                         }
                     } label: {
                         Label(isStarred ? "Remove from Favorites" : "Add to Favorites",
-                              systemImage: isStarred ? "heart.fill" : "heart")
+                              systemImage: isStarred ? "star.fill" : "star")
                     }
 
                     // Rating picker
-                    RatingPicker(currentRating: album.rating) { newRating in
+                    RatingPicker(currentRating: displayedAlbum.rating) { newRating in
                         setRating(newRating)
                     }
                 } label: {
-                    Image(systemName: "ellipsis.circle")
+                    Image(systemName: "ellipsis")
                 }
+                .menuIndicator(.hidden)
             }
         }
-        .task {
-            await loadSongs()
+        .task(id: loadIdentity) {
+            await loadSongs(identity: loadIdentity)
         }
-        .task {
-            await loadMoreByArtist()
+        .task(id: pointMetadataKey) {
+            await loadPointMetadata(key: pointMetadataKey)
+        }
+        .onChange(of: appState.albumPresentationRevision) { _, _ in
+            presentationState.absorbAcknowledged(appState.albumPresentationStore)
+        }
+        .task(id: loadIdentity) {
+            await loadMoreByArtist(identity: loadIdentity)
         }
         .onAppear {
+#if DEBUG
+            if DeterministicCaptureFixture.isAtlasEnabled {
+                ParityControlBridge.shared.detailSelectionSnapshot = { [self] in
+                    let ordered = displayedTrackIDs
+                    return ["kind": "album", "orderedSongIDs": ordered,
+                            "selectedIndices": ordered.indices.filter { trackSelection.selectedIDs.contains(ordered[$0]) },
+                            "focusedIndex": trackSelection.focusedID.flatMap { ordered.firstIndex(of: $0) } ?? NSNull() as Any]
+                }
+            }
+#endif
             // Capture the highlight song ID from AppState (set by NowPlayingBar navigation)
             if let songId = appState.navigationTargetSongId {
                 highlightSongId = songId
@@ -256,6 +320,17 @@ struct AlbumDetailView: View {
                 )
                 selectedGenre = nil
             }
+        }
+        .onChange(of: searchText) { _, _ in
+            refreshTrackProjection()
+        }
+        .onDisappear {
+            artistNavigationTask?.cancel()
+#if DEBUG
+            if DeterministicCaptureFixture.isAtlasEnabled {
+                ParityControlBridge.shared.detailSelectionSnapshot = nil
+            }
+#endif
         }
     }
 
@@ -288,10 +363,12 @@ struct AlbumDetailView: View {
                         trackRow(song: song, index: songs.firstIndex(of: song) ?? index)
                             .id(song.id)
 
-                        if index < songsToDisplay.count - 1 {
-                            Divider()
-                                .padding(.leading, 50)
-                        }
+                            .overlay(alignment: .bottom) {
+                                if index < songsToDisplay.count - 1 {
+                                    Divider()
+                                        .padding(.leading, 50)
+                                }
+                            }
                     }
                 }
             } else if hasMultipleDiscs {
@@ -312,10 +389,12 @@ struct AlbumDetailView: View {
                         trackRow(song: song, index: songs.firstIndex(of: song) ?? index)
                             .id(song.id)
 
-                        if index < discGroup.songs.count - 1 {
-                            Divider()
-                                .padding(.leading, 50)
-                        }
+                            .overlay(alignment: .bottom) {
+                                if index < discGroup.songs.count - 1 {
+                                    Divider()
+                                        .padding(.leading, 50)
+                                }
+                            }
                     }
                 }
             } else {
@@ -323,13 +402,45 @@ struct AlbumDetailView: View {
                     trackRow(song: song, index: index)
                         .id(song.id)
 
-                    if index < songs.count - 1 {
-                        Divider()
-                            .padding(.leading, 50)
-                    }
+                        .overlay(alignment: .bottom) {
+                            if index < songs.count - 1 {
+                                Divider()
+                                    .padding(.leading, 50)
+                            }
+                        }
                 }
             }
         }
+    }
+
+    /// This is the actual visual ordering (including disc groups), rather than
+    /// the transport order returned by the server.
+    private var displaySongIDs: [String] { displayedTrackIDs }
+
+    private func refreshTrackProjection() {
+        let ids = searchText.isEmpty
+            ? (hasMultipleDiscs ? songsByDisc.flatMap { $0.songs.map(\.id) } : songs.map(\.id))
+            : filteredSongs.map(\.id)
+        displayedTrackIDs = ids
+        playbackIndexByTrackID = Dictionary(uniqueKeysWithValues: songs.enumerated().map { ($0.element.id, $0.offset) })
+        trackSelection.prune(to: ids)
+        let songsByID = Dictionary(uniqueKeysWithValues: songs.map { ($0.id, $0) })
+        selectedTrackSongs = trackSelection.idsInDisplayOrder(ids).compactMap { songsByID[$0] }
+    }
+
+    private func selectTrack(_ id: String, modifiers: NSEvent.ModifierFlags) {
+        trackSelection.click(id, in: displayedTrackIDs, extending: modifiers.contains(.shift), toggling: modifiers.contains(.command))
+        refreshTrackProjection()
+    }
+
+    private func moveTrackSelection(_ offset: Int, modifiers: NSEvent.ModifierFlags) {
+        _ = trackSelection.moveFocus(by: offset, in: displayedTrackIDs, extending: modifiers.contains(.shift))
+        refreshTrackProjection()
+    }
+
+    private func playFocusedTrack() {
+        guard let id = trackSelection.focusedID, let index = playbackIndexByTrackID[id] else { return }
+        Task { await appState.playbackManager.play(songs: songs, startingAt: index) }
     }
 
     @ViewBuilder
@@ -342,6 +453,17 @@ struct AlbumDetailView: View {
             albumArtist: album.artist,
             isPlaying: isPlaying,
             isHighlighted: isHighlighted,
+            isSelected: trackSelection.selectedIDs.contains(song.id),
+            selectedSongs: selectedTrackSongs,
+            onSelect: { modifiers in
+                selectTrack(song.id, modifiers: modifiers)
+            },
+            onFocus: { trackSelection.focus(song.id, in: displayedTrackIDs) },
+            onMove: { offset, modifiers in
+                moveTrackSelection(offset, modifiers: modifiers)
+            },
+            onSelectAll: { trackSelection.selectAll(in: displaySongIDs); refreshTrackProjection() },
+            onActivateFocused: { playFocusedTrack() },
             onDoubleTap: {
                 Task {
                     await appState.playbackManager.play(songs: songs, startingAt: index)
@@ -349,77 +471,42 @@ struct AlbumDetailView: View {
             }
         )
         .contextMenu {
-            SongContextMenu(song: song)
-        }
-    }
-
-    // MARK: - Credits Section
-
-    @ViewBuilder
-    private var creditsSection: some View {
-        let genres = songs.compactMap(\.genre).uniqued()
-
-        if !genres.isEmpty || album.year != nil {
-            VStack(alignment: .leading, spacing: 16) {
-                Text("About")
-                    .font(.title3)
-                    .fontWeight(.semibold)
-
-                VStack(alignment: .leading, spacing: 12) {
-                    // Release info
-                    if let year = album.year {
-                        HStack {
-                            Text("Released")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Text(String(year))
-                        }
-                        .font(.subheadline)
-                    }
-
-                    // Genre
-                    if let genre = album.genre ?? genres.first {
-                        HStack {
-                            Text("Genre")
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                            Button(genre) {
-                                selectedGenre = genre
-                            }
-                            .buttonStyle(.plain)
-                            .foregroundStyle(.primary)
-                        }
-                        .font(.subheadline)
-                    }
-
-                    // Track count and duration
-                    HStack {
-                        Text("Tracks")
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                        Text("\(album.songCount) songs, \(formattedTotalDuration)")
-                    }
-                    .font(.subheadline)
-                }
-                .padding()
-                .background {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(.ultraThinMaterial)
-                }
+            if trackSelection.selectedIDs.contains(song.id), selectedTrackSongs.count > 1 {
+                BulkSongContextMenu(songs: selectedTrackSongs)
+            } else {
+                SongContextMenu(song: song)
             }
-            .padding()
         }
     }
 
-    private var formattedTotalDuration: String {
-        let totalSeconds = album.duration
-        let hours = totalSeconds / 3600
-        let minutes = (totalSeconds % 3600) / 60
+    // MARK: - Album Summary
 
-        if hours > 0 {
-            return "\(hours) hr \(minutes) min"
+    private var creditsSection: some View {
+        // Native places a plain multiline summary below the tracks, not an
+        // About heading and a material card. Only show metadata we actually have.
+        Text(albumSummary)
+            .font(.system(size: 13))
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(.leading, 51)
+            .padding(.trailing, 34)
+            .padding(.top, 28)
+            .padding(.bottom, 55)
+            .accessibilityIdentifier("summary")
+    }
+
+    private var albumSummary: String {
+        var lines: [String] = []
+        if let releaseDate = displayedAlbum.releaseDate, releaseDate.storageValue != nil {
+            lines.append(releaseDate.summaryDisplayValue)
+        } else if let year = displayedAlbum.year {
+            // A known year is shown at its actual precision, not a guessed day.
+            lines.append(String(year))
         }
-        return "\(minutes) min"
+        let stats = AlbumFooterStats(songs: songs)
+        lines.append("\(stats.songCount) \(stats.songCount == 1 ? "song" : "songs"), \(stats.formattedDuration)")
+        return lines.joined(separator: "\n")
     }
 
     private func albumsMatchingGenre(_ genre: String) -> Set<String> {
@@ -433,32 +520,54 @@ struct AlbumDetailView: View {
         let otherAlbums = moreByArtist.filter { $0.id != album.id }
 
         if !otherAlbums.isEmpty {
-            VStack(alignment: .leading, spacing: 16) {
-                HStack {
-                    Text("More by \(album.artist)")
-                        .font(.title3)
-                        .fontWeight(.semibold)
-
-                    Spacer()
-
-                    Button {
-                        navigateToArtist()
-                    } label: {
-                        Text("See All")
-                            .font(.subheadline)
+            VStack(alignment: .leading, spacing: 0) {
+                // Native shelf header occupies 47 points, with its navigation
+                // button 34 points from the collection edge and 15 from the top.
+                Button {
+                    navigateToArtist()
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("More By \(displayedAlbum.artist)")
+                            .font(.title3)
+                            .fontWeight(.semibold)
+                        Image(systemName: "chevron.right")
+                            .foregroundStyle(.secondary)
                     }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
                 }
-                .padding(.horizontal)
+                .buttonStyle(.plain)
+                .accessibilityLabel("More By \(displayedAlbum.artist)")
+                .accessibilityIdentifier("MoreByArtist")
+                .padding(.top, 15)
+                .padding(.horizontal, 34)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(height: 47, alignment: .topLeading)
 
                 ScrollView(.horizontal, showsIndicators: false) {
-                    HStack(spacing: 16) {
+                    HStack(alignment: .top, spacing: 20) {
                         ForEach(otherAlbums.prefix(10)) { otherAlbum in
-                            NavigationLink(value: otherAlbum) {
-                                AlbumCard(album: otherAlbum)
+                            AlbumCardActionSurface(
+                                album: otherAlbum,
+                                onPlay: { Task { await playAlbum(otherAlbum) } }
+                            ) { artworkHoverChanged in
+                                Button {
+                                    appState.detailNavigationPath.append(otherAlbum)
+                                } label: {
+                                    // Current native More By shelf: artwork180,
+                                    // column pitch200, two-line title and year.
+                                    AlbumCard(
+                                        album: otherAlbum,
+                                        titleLineLimit: 2,
+                                        artworkSize: 180,
+                                        subtitleOverride: otherAlbum.year.map(String.init) ?? "",
+                                        libraryTypography: true,
+                                        showsHoverPlayButton: false,
+                                        onArtworkHoverChange: artworkHoverChanged
+                                    )
+                                    .frame(height: 232, alignment: .top)
+                                }
+                                .buttonStyle(.plain)
+                                .accessibilityIdentifier("MoreByAlbum-\(otherAlbum.id)")
                             }
-                            .buttonStyle(.plain)
                             .contextMenu {
                                 Button {
                                     Task {
@@ -494,10 +603,22 @@ struct AlbumDetailView: View {
                             }
                         }
                     }
-                    .padding(.horizontal)
+                    .padding(.horizontal, 34)
                 }
             }
-            .padding(.vertical)
+            .padding(.bottom, 12)
+            .padding(.trailing, NSScroller.scrollerWidth(for: .regular, scrollerStyle: .overlay))
+        } else if let error = moreByArtistError {
+            CompactStatusView(
+                title: "Couldn’t Load More by Artist",
+                systemImage: error.systemImage,
+                message: error.errorDescription,
+                actionTitle: "Retry",
+                actionSystemImage: "arrow.clockwise"
+            ) {
+                loadRetry += 1
+            }
+            .padding(.horizontal)
         } else if isLoadingMore {
             ProgressView()
                 .frame(maxWidth: .infinity)
@@ -507,47 +628,92 @@ struct AlbumDetailView: View {
 
     // MARK: - Actions
 
-    private func loadSongs() async {
-        viewState = .loading
+    private func ownsSongsLoad(_ generation: UUID, identity: LoadIdentity) -> Bool {
+        !Task.isCancelled && generation == songsLoadGeneration && identity == loadIdentity
+    }
 
+    private func ownsMoreLoad(_ generation: UUID, identity: LoadIdentity) -> Bool {
+        !Task.isCancelled && generation == moreLoadGeneration && identity == loadIdentity
+    }
+
+    private func loadPointMetadata(key: PointMetadataKey) async {
+        guard let serverID = key.serverID else { return }
         do {
-            let fetchedSongs = try await appState.networkActor.fetchAlbumSongs(albumId: album.id)
-            let admittedSongIds = appState.activeServerId.flatMap {
-                try? appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: $0)
-            } ?? appState.admittedSongIds
-            let filteredSongs = fetchedSongs.filter {
-                !appState.hiddenSongIds.contains($0.id) &&
-                (!isAlbumAdmitted || admittedSongIds.contains($0.id))
-            }
-            await MainActor.run {
-                songs = filteredSongs
-                updateSongsByDisc()
-                viewState = .populated
-            }
-        } catch let error as ResonanceError {
-            viewState = .error(error)
+            let fresh = try await appState.databaseManager.cachedAlbum(
+                id: key.albumID, serverID: serverID
+            )
+            guard !Task.isCancelled, key == pointMetadataKey else { return }
+            presentationState.updatePoint(fresh, store: appState.albumPresentationStore)
+        } catch is CancellationError {
+            return
         } catch {
-            viewState = .error(.networkUnavailable)
+            // The navigation payload remains usable if a point cache read fails.
         }
     }
 
-    private func loadMoreByArtist() async {
-        guard !album.artistId.isEmpty else { return }
-
-        isLoadingMore = true
-        defer { isLoadingMore = false }
+    private func loadSongs(identity: LoadIdentity) async {
+        guard !Task.isCancelled, identity == loadIdentity else { return }
+        let generation = UUID()
+        songsLoadGeneration = generation
+        songs = []
+        cachedSongsByDisc = []
+        viewState = .loading
+        guard let serverId = identity.serverId else {
+            viewState = .error(.notConfigured)
+            return
+        }
 
         do {
-            let artistDetail = try await appState.networkActor.fetchArtist(id: album.artistId)
-            let admittedAlbumIds = appState.activeServerId.flatMap {
-                try? appState.databaseManager.loadLibraryMemberIds(type: .album, serverId: $0)
-            } ?? appState.admittedAlbumIds
+            let fetchedSongs = try await appState.networkActor.fetchAlbumSongs(albumId: identity.albumId, expectedServerID: UUID(uuidString: serverId))
+            guard ownsSongsLoad(generation, identity: identity) else { return }
+            // Read the captured server's policy, never a new server's sets or a
+            // fail-open fallback after a suspended request.
+            let admittedSongIds = try appState.databaseManager.loadLibraryMemberIds(type: .song, serverId: serverId)
+            let hiddenSongIds = try appState.databaseManager.loadHiddenIds(type: "song", serverId: serverId)
+            let albumIsAdmitted = try appState.databaseManager.isInLibrary(id: identity.albumId, type: .album, serverId: serverId)
+            songs = fetchedSongs.filter {
+                !hiddenSongIds.contains($0.id) &&
+                (!albumIsAdmitted || admittedSongIds.contains($0.id))
+            }
+            updateSongsByDisc()
+            viewState = .populated
+        } catch {
+            guard ownsSongsLoad(generation, identity: identity) else { return }
+            viewState = .error((error as? ResonanceError) ?? .unknown(error))
+        }
+    }
+
+    private func loadMoreByArtist(identity: LoadIdentity) async {
+        guard !Task.isCancelled, identity == loadIdentity else { return }
+        let generation = UUID()
+        moreLoadGeneration = generation
+        moreByArtist = []
+        selectedArtist = nil
+        moreByArtistError = nil
+        isLoadingMore = false
+        guard let serverId = identity.serverId, !identity.artistId.isEmpty else { return }
+
+        isLoadingMore = true
+        defer {
+            if ownsMoreLoad(generation, identity: identity) { isLoadingMore = false }
+        }
+
+        do {
+            let artistDetail = try await appState.networkActor.fetchArtist(id: identity.artistId, expectedServerID: UUID(uuidString: serverId))
+            guard ownsMoreLoad(generation, identity: identity) else { return }
+            selectedArtist = Artist(id: artistDetail.id, name: artistDetail.name,
+                                    albumCount: artistDetail.albumCount, coverArt: artistDetail.coverArt,
+                                    starred: artistDetail.starred)
+            let admittedAlbumIds = try appState.databaseManager.loadLibraryMemberIds(type: .album, serverId: serverId)
+            let hiddenAlbumIds = try appState.databaseManager.loadHiddenIds(type: "album", serverId: serverId)
+            let albumIsAdmitted = try appState.databaseManager.isInLibrary(id: identity.albumId, type: .album, serverId: serverId)
             moreByArtist = artistDetail.albums.filter {
-                !appState.hiddenAlbumIds.contains($0.id) &&
-                (!isAlbumAdmitted || admittedAlbumIds.contains($0.id))
+                !hiddenAlbumIds.contains($0.id) &&
+                (!albumIsAdmitted || admittedAlbumIds.contains($0.id))
             }
         } catch {
-            // Non-critical - just don't show the section
+            guard ownsMoreLoad(generation, identity: identity) else { return }
+            moreByArtistError = (error as? ResonanceError) ?? .unknown(error)
         }
     }
 
@@ -675,11 +841,12 @@ struct AlbumDetailView: View {
             if isStarred {
                 try await appState.networkActor.unstar(id: album.id, type: .album)
                 appState.updateAlbumStarred(id: album.id, starred: nil)
-                isStarred = false
+                presentationState.absorbAcknowledged(appState.albumPresentationStore)
             } else {
+                let now = Date()
                 try await appState.networkActor.star(id: album.id, type: .album)
-                appState.updateAlbumStarred(id: album.id, starred: Date())
-                isStarred = true
+                appState.updateAlbumStarred(id: album.id, starred: now)
+                presentationState.absorbAcknowledged(appState.albumPresentationStore)
             }
         } catch {
             // API call failed, don't update local state
@@ -690,20 +857,64 @@ struct AlbumDetailView: View {
         let newRating = rating == 0 ? nil : rating
 
         // Optimistic update
-        appState.updateAlbumRating(id: album.id, rating: newRating)
+        let actionRevision = appState.updateAlbumRating(id: album.id, rating: newRating)
 
         Task {
             do {
                 try await appState.networkActor.setRating(id: album.id, rating: rating)
+                appState.confirmAlbumRating(id: album.id, actionRevision: actionRevision)
+                presentationState.absorbAcknowledged(appState.albumPresentationStore)
             } catch {
-                // Revert on failure - but we don't have previous state easily accessible
+                appState.rejectAlbumRating(id: album.id, actionRevision: actionRevision)
+                presentationState.absorbAcknowledged(appState.albumPresentationStore)
             }
         }
     }
 
     private func navigateToArtist() {
-        appState.navigationTargetArtistId = album.artistId
-        appState.selectedSidebarItem = .artists
+        guard !displayedAlbum.artistId.isEmpty else { return }
+        // Use the artist returned with this shelf instead of a sidebar deep
+        // link, which used to silently fail when that artist was not cached.
+        if let artist = selectedArtist ?? appState.artists.first(where: { $0.id == displayedAlbum.artistId }) {
+            appState.detailNavigationPath.append(artist)
+            return
+        }
+        artistNavigationTask?.cancel()
+        let identity = loadIdentity
+        let origin = appState.detailNavigationPath
+        artistNavigationTask = Task { @MainActor in
+            do {
+                let detail = try await appState.networkActor.fetchArtist(id: identity.artistId,
+                    expectedServerID: identity.serverId.flatMap(UUID.init(uuidString:)))
+                guard !Task.isCancelled, identity == loadIdentity,
+                      appState.detailNavigationPath == origin else { return }
+                appState.detailNavigationPath.append(Artist(id: detail.id, name: detail.name,
+                    albumCount: detail.albumCount, coverArt: detail.coverArt, starred: detail.starred))
+            } catch {
+                guard !Task.isCancelled, identity == loadIdentity else { return }
+                appState.feedback = AppFeedback(message: "Couldn’t open artist", detail: error.localizedDescription,
+                    style: .error, systemImage: "exclamationmark.triangle", actionTitle: nil, action: nil)
+            }
+        }
+    }
+}
+
+/// Footer totals deliberately describe the fetched, policy-visible track list.
+/// Album metadata can be stale or aggregate historic rows that the server did
+/// not return for this album request.
+struct AlbumFooterStats: Equatable {
+    let songCount: Int
+    let totalDuration: Int
+
+    init(songs: [Song]) {
+        songCount = songs.count
+        totalDuration = songs.reduce(into: 0) { $0 += $1.duration }
+    }
+
+    var formattedDuration: String {
+        let hours = totalDuration / 3600
+        let minutes = (totalDuration % 3600) / 60
+        return hours > 0 ? "\(hours) hr \(minutes) min" : "\(minutes) min"
     }
 }
 
@@ -711,95 +922,98 @@ struct AlbumDetailView: View {
 
 /// Specialized track row for album detail view
 struct AlbumTrackRow: View {
+    @Environment(AppState.self) private var appState
+    @State private var downloaded = false
+    @State private var downloadedURL: URL?
+    @State private var downloadedKey: DownloadStatusKey?
     let song: Song
     let albumArtist: String
     var isPlaying: Bool = false
     var isHighlighted: Bool = false
+    var isSelected: Bool = false
+    var selectedSongs: [Song] = []
+    var onSelect: (NSEvent.ModifierFlags) -> Void = { _ in }
+    var onFocus: () -> Void = {}
+    var onMove: (Int, NSEvent.ModifierFlags) -> Void = { _, _ in }
+    var onSelectAll: () -> Void = {}
+    var onActivateFocused: () -> Void = {}
     var onDoubleTap: () -> Void
 
+    private struct DownloadStatusKey: Hashable {
+        let serverId: UUID?
+        let songId: String
+        let revision: UInt64
+    }
+
+    private var downloadStatusKey: DownloadStatusKey {
+        let serverId = appState.activeServerId.flatMap(UUID.init(uuidString:))
+        return DownloadStatusKey(serverId: serverId, songId: song.id,
+                                 revision: serverId.map { appState.cacheActor.downloadProgress.manifestRevisions[$0, default: 0] } ?? 0)
+    }
+
+    private var hasDownloadedAudio: Bool {
+        downloadedKey == downloadStatusKey && downloaded
+    }
+
     var body: some View {
-        HStack(spacing: 12) {
-            // Track number or playing indicator
-            Group {
-                if isPlaying {
-                    Image(systemName: "speaker.wave.2.fill")
-                        .foregroundStyle(Color.accentColor)
-                        .symbolEffect(.variableColor.iterative, isActive: true)
+        HStack(spacing: 0) {
+            AlbumTrackRowSelectionControl(
+                song: song,
+                albumArtist: albumArtist,
+                isPlaying: isPlaying,
+                isHighlighted: isHighlighted,
+                isSelected: isSelected,
+                isDownloaded: hasDownloadedAudio,
+                onSelect: onSelect,
+                onFocus: onFocus,
+                onMove: onMove,
+                onSelectAll: onSelectAll,
+                onActivateFocused: onActivateFocused,
+                onDoubleTap: onDoubleTap
+            )
+
+            Menu {
+                if isSelected, selectedSongs.count > 1 {
+                    BulkSongContextMenu(songs: selectedSongs)
                 } else {
-                    Text("\(song.track ?? 0)")
-                        .foregroundStyle(.secondary)
+                    SongContextMenu(song: song, downloadState: downloadedKey == downloadStatusKey
+                                    ? downloadedURL.map { .downloaded($0) } ?? .absent : nil)
                 }
+            } label: {
+                Image(systemName: "ellipsis")
+                    .foregroundStyle(Color.accentColor)
+                    .frame(width: 18, height: 18)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
             }
-            .font(.subheadline)
-            .monospacedDigit()
-            .frame(width: 28, alignment: .trailing)
-
-            // Song info
-            VStack(alignment: .leading, spacing: 2) {
-                HStack(spacing: 6) {
-                    Text(song.title)
-                        .font(.body)
-                        .fontWeight(isPlaying || isHighlighted ? .semibold : .regular)
-                        .foregroundStyle(isPlaying || isHighlighted ? Color.accentColor : .primary)
-                        .lineLimit(1)
-
-                    // Starred indicator
-                    if song.starred != nil {
-                        Image(systemName: "heart.fill")
-                            .font(.caption2)
-                            .foregroundStyle(.pink)
-                    }
-
-                    // Explicit indicator
-                    if song.isExplicit {
-                        Text("E")
-                            .font(.caption2)
-                            .fontWeight(.bold)
-                            .padding(.horizontal, 4)
-                            .padding(.vertical, 1)
-                            .background(.quaternary)
-                            .cornerRadius(2)
-                    }
-                }
-
-                // Show featuring artist if different from album artist
-                if song.artist != albumArtist {
-                    Text(song.artist)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                }
-            }
-
-            Spacer()
-
-            // Indicators
-            HStack(spacing: 8) {
-                // Rating indicator
-                RatingIndicator(rating: song.rating)
-
-                // Duration
-                Text(song.formattedDuration)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .accessibilityLabel("More for \(song.title)")
+            .help("More")
+            .padding(.leading, 9)
+            .frame(width: 84, height: 46, alignment: .leading)
+            .contentShape(Rectangle())
         }
-        .padding(.vertical, 6)
-        .padding(.horizontal, isHighlighted ? 8 : 0)
+        // Native trackTable AXRow height46 at both1000/1500 window widths.
+        .frame(height: 46)
         .background(
-            isHighlighted
-                ? RoundedRectangle(cornerRadius: 6).fill(Color.accentColor.opacity(0.1))
-                : nil
+            RoundedRectangle(cornerRadius: 6)
+                .fill(isHighlighted || isSelected ? Color.accentColor.opacity(0.1) : .clear)
         )
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            onDoubleTap()
+        .task(id: downloadStatusKey) {
+            let key = downloadStatusKey
+            guard let serverId = key.serverId else {
+                downloaded = false
+                downloadedURL = nil
+                downloadedKey = key
+                return
+            }
+            let path = await appState.cacheActor.getDownloadedAudioPath(for: key.songId, serverId: serverId)
+            guard !Task.isCancelled, key == downloadStatusKey else { return }
+            downloaded = path != nil
+            downloadedURL = path
+            downloadedKey = key
         }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel(accessibilityLabel)
-        .accessibilityHint("Double tap to play")
-        .accessibilityAddTraits(isPlaying ? [.isButton, .isSelected] : .isButton)
     }
 
     private var accessibilityLabel: String {
@@ -818,6 +1032,120 @@ struct AlbumTrackRow: View {
     }
 }
 
+/// The focus and keyboard-modifier chain is isolated from the download menu so
+/// SwiftUI does not have to infer one deeply nested button/menu expression.
+private struct AlbumTrackRowSelectionControl: View {
+    @FocusState private var isFocused: Bool
+    let song: Song
+    let albumArtist: String
+    let isPlaying: Bool
+    let isHighlighted: Bool
+    let isSelected: Bool
+    let isDownloaded: Bool
+    let onSelect: (NSEvent.ModifierFlags) -> Void
+    let onFocus: () -> Void
+    let onMove: (Int, NSEvent.ModifierFlags) -> Void
+    let onSelectAll: () -> Void
+    let onActivateFocused: () -> Void
+    let onDoubleTap: () -> Void
+
+    var body: some View {
+        Button(action: selectCurrentTrack) {
+            AlbumTrackRowContent(
+                song: song,
+                albumArtist: albumArtist,
+                isPlaying: isPlaying,
+                isHighlighted: isHighlighted,
+                isDownloaded: isDownloaded
+            )
+        }
+        .buttonStyle(.plain)
+        .focused($isFocused)
+        .onTapGesture(count: 2, perform: onDoubleTap)
+        .onKeyPress(.return) { activateFocusedTrack() }
+        .onKeyPress(keys: [.upArrow, .downArrow]) { press in moveFocus(press) }
+        .onKeyPress("a", phases: .down) { press in selectAllIfCommand(press) }
+        .onChange(of: isFocused) { _, focused in
+            if focused { onFocus() }
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityIdentifier("AlbumDetail.Track.\(song.id)")
+        .accessibilityHint(isSelected ? "Selected. Press Return or double click to play." : "Select track. Press Return or double click to play.")
+        .accessibilityAddTraits(isPlaying || isSelected ? [.isSelected] : [])
+        .accessibilityAction { onSelect([]) }
+        .accessibilityAction(named: "Play") { onDoubleTap() }
+    }
+
+    private func selectCurrentTrack() {
+        onSelect(NSApp.currentEvent?.modifierFlags ?? NSEvent.modifierFlags)
+    }
+
+    private func activateFocusedTrack() -> KeyPress.Result {
+        onActivateFocused()
+        return .handled
+    }
+
+    private func moveFocus(_ press: KeyPress) -> KeyPress.Result {
+        onMove(press.key == .upArrow ? -1 : 1,
+               press.modifiers.contains(.shift) ? .shift : [])
+        return .handled
+    }
+
+    private func selectAllIfCommand(_ press: KeyPress) -> KeyPress.Result {
+        guard press.modifiers == .command else { return .ignored }
+        onSelectAll()
+        return .handled
+    }
+
+    private var accessibilityLabel: String {
+        var label = "Track \(song.track ?? 0): \(song.title)"
+        if isPlaying { label = "Now playing: " + label }
+        label += ", \(song.formattedDuration)"
+        if song.starred != nil { label += ", loved" }
+        if song.isExplicit { label += ", explicit" }
+        return label
+    }
+}
+
+private struct AlbumTrackRowContent: View {
+    let song: Song
+    let albumArtist: String
+    let isPlaying: Bool
+    let isHighlighted: Bool
+    let isDownloaded: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Group { if song.starred != nil { Image(systemName: "star.fill").font(.caption2).foregroundStyle(Color.accentColor) } else { Color.clear } }
+                .frame(width: 40)
+            trackIndicator.frame(width: 40)
+            songInfo.frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 3)
+            RatingIndicator(rating: song.rating)
+            Group { if isDownloaded { Image(systemName: "arrow.down.circle.fill").foregroundStyle(Color.accentColor) } else { Color.clear } }
+                .frame(width: 16)
+            Text(song.formattedDuration).font(.system(size: 13)).foregroundStyle(.secondary).monospacedDigit().frame(width: 45)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity).contentShape(Rectangle())
+    }
+
+    @ViewBuilder private var trackIndicator: some View {
+        if isPlaying { Image(systemName: "speaker.wave.2.fill").foregroundStyle(Color.accentColor).symbolEffect(.variableColor.iterative, isActive: true) }
+        else { Text(String(song.track ?? 0)).foregroundStyle(.secondary) }
+    }
+
+    private var songInfo: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack(spacing: 6) {
+                Text(song.title).font(.body).fontWeight(isPlaying || isHighlighted ? .semibold : .regular)
+                    .foregroundStyle(isPlaying || isHighlighted ? Color.accentColor : .primary).lineLimit(1)
+                if song.isExplicit { Text("E").font(.caption2).fontWeight(.bold).padding(.horizontal, 4).background(.quaternary).cornerRadius(2) }
+            }
+            if song.artist != albumArtist { Text(song.artist).font(.caption).foregroundStyle(.secondary).lineLimit(1) }
+        }
+    }
+}
+
 struct AlbumHeaderView: View {
     let album: Album
     let songs: [Song]
@@ -829,99 +1157,130 @@ struct AlbumHeaderView: View {
     var onGenreTap: ((String) -> Void)? = nil
 
     var body: some View {
-        HStack(alignment: .bottom, spacing: 24) {
+        HStack(alignment: .bottom, spacing: 31) {
             // Album art with shadow
             ZStack(alignment: .bottomTrailing) {
-                EnvironmentAlbumArtView(coverArtId: album.coverArt, size: .large)
-                    .frame(width: 220, height: 220)
+                EnvironmentAlbumArtView(coverArtId: album.coverArt, size: .large, flexible: true)
+                    .frame(width: 270, height: 270)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
                     .shadow(color: .black.opacity(0.2), radius: 20, x: 0, y: 10)
                     .shadow(color: .black.opacity(0.1), radius: 4, x: 0, y: 2)
             }
 
             // Info
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Album")
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .textCase(.uppercase)
+            VStack(alignment: .leading, spacing: 27) {
+                VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 0) {
+                        Text(album.name)
+                            // Current AMPAlbumHeaderLockup title1Field default.
+                            .font(.system(size: 26, weight: .semibold))
+                            .lineLimit(2)
 
-                Text(album.name)
-                    .font(.largeTitle)
-                    .fontWeight(.bold)
-                    .lineLimit(2)
+                        // Clickable artist name (accent color for better affordance)
+                        Button {
+                            onArtistTap?()
+                        } label: {
+                            Text(album.artist)
+                                // Current AMPAlbumHeaderLockup title2Field default.
+                                .font(.system(size: 26, weight: .regular))
+                                .lineLimit(2)
+                                .foregroundStyle(onArtistTap != nil ? Color.accentColor : .secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(onArtistTap == nil)
 
-                // Clickable artist name (accent color for better affordance)
-                Button {
-                    onArtistTap?()
-                } label: {
-                    Text(album.artist)
-                        .font(.title2)
-                        .foregroundStyle(onArtistTap != nil ? Color.accentColor : .secondary)
-                }
-                .buttonStyle(.plain)
-                .disabled(onArtistTap == nil)
-
-                // Metadata row
-                HStack(spacing: 8) {
-                    if let year = album.year {
-                        Text(String(year))
                     }
 
-                    if let genre = album.genre {
-                        Text("•")
-                        if let onGenreTap {
-                            Button(genre) {
-                                onGenreTap(genre)
+                    // Captured native caption: genre, separator, year, then
+                    // capability metadata when available. Do not invent Lossless.
+                    let captionGenre = album.genre ?? songs.compactMap(\.genre).first
+                    HStack(spacing: 4) {
+                        if let genre = captionGenre {
+                            if let onGenreTap {
+                                Button(genre) {
+                                    onGenreTap(genre)
+                                }
+                                .buttonStyle(.plain)
+                            } else {
+                                Text(genre)
                             }
-                            .buttonStyle(.plain)
-                        } else {
-                            Text(genre)
+                        }
+
+                        if let year = album.year {
+                            if captionGenre != nil {
+                                Text("·")
+                            }
+                            Text(String(year))
                         }
                     }
+                    // AMPAlbumHeaderLockup calloutField factory value.
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
 
-                    Text("•")
-                    Text("\(album.songCount) songs")
-
-                    Text("•")
-                    Text(formattedDuration)
                 }
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
 
-                Spacer()
-
-                // Action buttons (both outlined style, like Apple Music)
-                HStack(spacing: 12) {
-                    Button(action: onPlay) {
-                        Label("Play", systemImage: "play.fill")
+                // Live native AX: shuffle38, gap10, play132, all38 high.
+                // Bordered style adds24 horizontal/8 vertical to these labels.
+                // Native material rendering is not yet certified.
+                HStack(spacing: 10) {
+                    Button(action: onShuffle) {
+                        Image(systemName: "shuffle")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 14, height: 30)
                     }
                     .buttonStyle(.bordered)
-                    .tint(.accentColor)
+                    .buttonBorderShape(.capsule)
+                    .accessibilityLabel("Shuffle")
+                    .accessibilityIdentifier("AlbumDetail.Shuffle")
+                    .help("Shuffle")
                     .disabled(songs.isEmpty)
 
-                    Button(action: onShuffle) {
-                        Label("Shuffle", systemImage: "shuffle")
+                    Button(action: onPlay) {
+                        HStack(spacing: 3) {
+                            Image(systemName: "play.fill")
+                            Text("Play")
+                        }
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(Color.accentColor)
+                            .frame(width: 108, height: 30)
                     }
                     .buttonStyle(.bordered)
+                    .buttonBorderShape(.capsule)
+                    .accessibilityLabel("Play")
+                    .accessibilityIdentifier("AlbumDetail.Play")
+                    .tint(.accentColor)
                     .disabled(songs.isEmpty)
 
                     Spacer()
 
-                    // Love/Star button
+                    // Retain the server favorite action with Music's star glyph.
                     Button(action: onToggleStar) {
-                        Image(systemName: isStarred ? "heart.fill" : "heart")
-                            .font(.title2)
-                            .foregroundStyle(isStarred ? .pink : .secondary)
+                        Image(systemName: isStarred ? "star.fill" : "star")
+                            .font(.system(size: 15))
+                            .foregroundStyle(isStarred ? Color.accentColor : .secondary)
+                            .frame(width: 36, height: 36)
                     }
                     .buttonStyle(.plain)
+                    .accessibilityLabel(isStarred ? "Remove album from Favorites" : "Add album to Favorites")
+                    .accessibilityIdentifier("AlbumDetail.Favorite")
                     .help(isStarred ? "Remove from Favorites" : "Add to Favorites")
                 }
+                .font(.system(size: 15, weight: .semibold))
+                .frame(height: 38)
+                // Native AX action bounds extend1pt below the artwork bottom.
+                .offset(y: 1)
             }
-
-            Spacer()
+            .frame(maxWidth: .infinity)
+            .frame(height: 270)
         }
-        .padding(24)
+        // Current native album-detail AX at widths1000/1500: artwork270,
+        // leading40 below toolbar, metadata leading341 (31pt artwork gap).
+        // Text metrics and metadata vertical placement remain unverified.
+        .padding(.horizontal, 40)
+        .padding(.bottom, 20)
     }
 
     private var formattedDuration: String {

@@ -1,15 +1,64 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
     @Environment(AppState.self) private var appState
     @Environment(\.emotionEngine) private var emotionEngine
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var sidebarTrailingEdge: CGFloat = 0
 
     var body: some View {
+        splitView
+        .onAppear {
+            appState.reconcileSidebarSelectionWithVisibility()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification)) { _ in
+            appState.reconcileSidebarSelectionWithVisibility()
+        }
+        .overlay(alignment: .bottom) {
+            NowPlayingBarInset(contentLeading: sidebarTrailingEdge)
+        }
+        .accessibilityIdentifier(parityFixtureAccessibilityIdentifier)
+        // Keep the protected Command HUD modal over the footer and inspector,
+        // not only over the split-view content.
+        .overlay {
+            if appState.isCommandHUDVisible {
+                ZStack(alignment: .top) {
+                    Color.black.opacity(0.18)
+                        .ignoresSafeArea()
+                        .contentShape(Rectangle())
+                        .onTapGesture { appState.isCommandHUDVisible = false }
+
+                    CommandHUDView()
+                        .padding(.top, 110)
+                }
+                .transition(reduceMotion ? .identity : .opacity)
+            }
+        }
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.12), value: appState.isCommandHUDVisible)
+    }
+
+    private var parityFixtureAccessibilityIdentifier: String {
+        guard let fixture = DeterministicCaptureFixture.configuration else {
+            return "Resonance.ContentView"
+        }
+        return "ParityFixture.route.\(fixture.route.rawValue).state.\(fixture.state.rawValue)"
+    }
+
+    private var splitView: some View {
         NavigationSplitView {
             SidebarView()
+                .background {
+                    SidebarAllocationProbe { trailingEdge in
+                        sidebarTrailingEdge = trailingEdge
+                    }
+                }
         } detail: {
             DetailView()
                 .accessibilityIdentifier("DetailView")
+                // Reserve scrolling room, not a blank viewport strip: library
+                // content must remain behind the floating glass footer.
+                .contentMargins(.bottom, 82, for: .scrollContent)
         }
         .mouseNavigationHandler(appState: appState)
         .navigationSplitViewStyle(.balanced)
@@ -23,18 +72,21 @@ struct ContentView: View {
             }
         }
         .inspector(isPresented: Binding(
-            get: { appState.isLyricsPanelVisible },
-            set: { appState.isLyricsPanelVisible = $0 }
+            get: { appState.nowPlayingInspector != nil },
+            set: { if !$0 { appState.nowPlayingInspector = nil } }
         )) {
-            LyricsView()
-                .inspectorColumnWidth(min: 250, ideal: 300, max: 400)
-        }
-        .inspector(isPresented: Binding(
-            get: { appState.isQueueVisible },
-            set: { appState.isQueueVisible = $0 }
-        )) {
-            ContinuePlayingPanel()
-                .inspectorColumnWidth(min: 280, ideal: 320, max: 400)
+            switch appState.nowPlayingInspector {
+            case .lyrics:
+                LyricsView()
+                    .inspectorColumnWidth(min: 250, ideal: 300, max: 400)
+                    .contentMargins(.bottom, 82, for: .scrollContent)
+            case .queue:
+                ContinuePlayingPanel()
+                    .inspectorColumnWidth(min: 258, ideal: 258, max: 400)
+                    .contentMargins(.bottom, 82, for: .scrollContent)
+            case nil:
+                EmptyView()
+            }
         }
         .sheet(isPresented: Binding(
             get: { !appState.isOnboardingComplete },
@@ -49,6 +101,13 @@ struct ContentView: View {
             set: { appState.showCreatePlaylistSheet = $0 }
         )) {
             CreatePlaylistSheet(initialSongIds: appState.createPlaylistSongIds)
+                .environment(appState)
+        }
+        .sheet(item: Binding(
+            get: { appState.playlistDestinationRequest },
+            set: { appState.playlistDestinationRequest = $0 }
+        )) { request in
+            PlaylistDestinationPicker(request: request)
                 .environment(appState)
         }
         .sheet(item: Binding(
@@ -186,7 +245,11 @@ struct ContentView: View {
                         action: feedback.action,
                         dismissAction: appState.dismissFeedback
                     )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(
+                        reduceMotion
+                            ? .identity
+                            : .move(edge: .bottom).combined(with: .opacity)
+                    )
                 }
 
                 if let message = appState.undoToastMessage {
@@ -198,37 +261,54 @@ struct ContentView: View {
                         actionTitle: "Undo",
                         action: appState.undoToastAction
                     )
-                    .transition(.move(edge: .bottom).combined(with: .opacity))
+                    .transition(
+                        reduceMotion
+                            ? .identity
+                            : .move(edge: .bottom).combined(with: .opacity)
+                    )
                 }
             }
             .padding(.horizontal, 40)
             .padding(.bottom, 80) // above the now playing bar
-            .animation(.spring(duration: 0.3), value: appState.feedback?.id)
-            .animation(.spring(duration: 0.3), value: appState.undoToastMessage)
+            .animation(reduceMotion ? nil : .spring(duration: 0.3), value: appState.feedback?.id)
+            .animation(reduceMotion ? nil : .spring(duration: 0.3), value: appState.undoToastMessage)
         }
-        // MARK: - ⌘K Command HUD (Quick Capture Command Layer)
-        .overlay {
-            if appState.isCommandHUDVisible {
-                ZStack(alignment: .top) {
-                    // Scrim: dim everything, click outside to close.
-                    Color.black.opacity(0.18)
-                        .ignoresSafeArea()
-                        .contentShape(Rectangle())
-                        .onTapGesture { appState.isCommandHUDVisible = false }
-                    CommandHUDView()
-                        .padding(.top, 110)
-                }
-                .transition(.opacity)
-            }
-        }
-        .animation(.easeOut(duration: 0.12), value: appState.isCommandHUDVisible)
     }
 }
 
 
+/// Constrain each navigation destination's hosting view to its allocated viewport.
+/// Applying this outside the navigation stack is too late: AppKit otherwise
+/// feeds a scroll view's content-derived minimum back into the inspector split.
+private struct DetailViewportLayout: ViewModifier {
+    func body(content: Content) -> some View {
+        content.frame(minWidth: 0, maxWidth: .infinity, minHeight: 0, maxHeight: .infinity)
+    }
+}
+
 struct DetailView: View {
     @Environment(AppState.self) private var appState
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var isLoadingNavigation = false
+    @State private var navigationTask: Task<Void, Never>?
+    @State private var pendingNavigation: PendingNavigation?
+
+    private enum NavigationTarget: Equatable {
+        case album(String)
+        case artist(String)
+    }
+
+    private enum NavigationTargetKind {
+        case album
+        case artist
+    }
+
+    private struct PendingNavigation: Equatable {
+        let target: NavigationTarget
+        let sidebar: SidebarItem
+        let serverID: UUID?
+        let generation: UUID
+    }
 
     var body: some View {
         @Bindable var state = appState
@@ -250,8 +330,6 @@ struct DetailView: View {
                     UnclassifiedView()
                 case .importPolicies:
                     ImportPoliciesView()
-                case .fetcherSources:
-                    FetcherSourcesView()
                 case .artists:
                     ArtistsView()
                 case .albums:
@@ -280,23 +358,31 @@ struct DetailView: View {
                     SearchView()
                 }
             }
+            .modifier(DetailViewportLayout())
             .navigationDestination(for: Album.self) { album in
                 AlbumDetailView(album: album)
+                    .id(album.id)
+                    .modifier(DetailViewportLayout())
             }
             .navigationDestination(for: Artist.self) { artist in
                 ArtistDetailView(artist: artist)
+                    .modifier(DetailViewportLayout())
             }
             .navigationDestination(for: Genre.self) { genre in
                 GenreDetailView(genre: genre)
+                    .modifier(DetailViewportLayout())
             }
             .navigationDestination(for: MusicFolder.self) { folder in
                 FolderDetailView(folder: folder)
+                    .modifier(DetailViewportLayout())
             }
             .navigationDestination(for: Playlist.self) { playlist in
                 PlaylistDetailView(playlist: playlist)
+                    .modifier(DetailViewportLayout())
             }
             .navigationDestination(for: SmartPlaylist.self) { smartPlaylist in
                 SmartPlaylistDetailView(playlist: smartPlaylist)
+                    .modifier(DetailViewportLayout())
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -316,16 +402,11 @@ struct DetailView: View {
                     .padding(24)
                     .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
                 }
-                .transition(.opacity)
+                .transition(reduceMotion ? .identity : .opacity)
             }
         }
-        .animation(.easeInOut(duration: 0.2), value: isLoadingNavigation)
-        .onChange(of: appState.selectedSidebarItem) { oldValue, newValue in
-            // Only clear path if NOT a deep link navigation (no pending targets)
-            if appState.navigationTargetAlbumId == nil && appState.navigationTargetArtistId == nil {
-                appState.detailNavigationPath = NavigationPath()
-            }
-        }
+        .animation(reduceMotion ? nil : .easeInOut(duration: 0.2), value: isLoadingNavigation)
+        .onAppear { appState.startNavigationHistory() }
         .onChange(of: appState.navigationTargetAlbumId) { _, albumId in
             handleAlbumNavigation(albumId)
         }
@@ -334,69 +415,68 @@ struct DetailView: View {
         }
         // Retry navigation when albums load (handles race condition)
         .onChange(of: appState.albums) { _, _ in
-            if appState.navigationTargetAlbumId != nil {
+            if appState.navigationTargetAlbumId != nil, !isLoadingNavigation {
                 handleAlbumNavigation(appState.navigationTargetAlbumId)
             }
         }
         // Retry navigation when artists load (handles race condition)
         .onChange(of: appState.artists) { _, _ in
-            if appState.navigationTargetArtistId != nil {
+            if appState.navigationTargetArtistId != nil, !isLoadingNavigation {
                 handleArtistNavigation(appState.navigationTargetArtistId)
             }
         }
-        .safeAreaInset(edge: .bottom, spacing: 0) {
-            NowPlayingBarInset()
+        .onChange(of: appState.selectedSidebarItem) { _, sidebar in
+            guard let pendingNavigation, pendingNavigation.sidebar != sidebar else { return }
+            finishNavigation(pendingNavigation, clearTarget: true)
+        }
+        .onDisappear {
+            if let pendingNavigation {
+                finishNavigation(pendingNavigation, clearTarget: true)
+            }
         }
     }
 
     private func handleAlbumNavigation(_ albumId: String?) {
         guard let albumId else {
-            isLoadingNavigation = false
+            cancelNavigation(target: .album)
+            return
+        }
+        let request = beginNavigation(target: .album(albumId))
+        guard isCurrentNavigation(request) else {
+            finishNavigation(request, clearTarget: true)
             return
         }
 
-        // Find album in loaded albums
-        if let album = appState.albums.first(where: { $0.id == albumId }) {
-            // Found - navigate
-            Task { @MainActor in
-                // Clear path first if we're on a different section
-                if appState.selectedSidebarItem != .albums {
-                    appState.detailNavigationPath = NavigationPath()
+        guard let serverID = request.serverID else {
+            finishNavigation(request, clearTarget: true)
+            return
+        }
+        isLoadingNavigation = true
+        navigationTask = Task { @MainActor in
+            do {
+                let cached = try await appState.databaseManager.cachedAlbum(
+                    id: albumId, serverID: serverID.uuidString
+                )
+                let album: Album
+                if let cached {
+                    album = cached
+                } else {
+                    album = try await appState.networkActor.fetchAlbum(
+                        id: albumId, expectedServerID: serverID
+                    )
                 }
-                // Small delay to let NavigationStack settle after sidebar change
-                try? await Task.sleep(for: .milliseconds(50))
-                appState.detailNavigationPath.append(album)
-                appState.navigationTargetAlbumId = nil
-                isLoadingNavigation = false
-            }
-        } else if appState.albums.isEmpty {
-            // Albums not loaded yet - trigger fetch and show loading
-            isLoadingNavigation = true
-            Task {
-                do {
-                    let albums = try await appState.networkActor.fetchAllAlbums().albums
-                    await MainActor.run {
-                        appState.albums = albums
-                        // onChange handler will retry navigation automatically
-                    }
-                } catch {
-                    // Fetch failed - clear pending navigation
-                    await MainActor.run {
-                        appState.navigationTargetAlbumId = nil
-                        isLoadingNavigation = false
-                    }
+                try Task.checkCancellation()
+                guard isCurrentNavigation(request) else {
+                    finishNavigation(request, clearTarget: true)
+                    return
                 }
-            }
-        } else {
-            // Albums loaded but album not found - clear after brief timeout
-            // (album may have been deleted from server)
-            Task {
-                try? await Task.sleep(for: .milliseconds(500))
-                await MainActor.run {
-                    if appState.navigationTargetAlbumId == albumId {
-                        appState.navigationTargetAlbumId = nil
-                        isLoadingNavigation = false
-                    }
+                pushAlbum(appState.presentedAlbum(album))
+                finishNavigation(request, clearTarget: true)
+            } catch is CancellationError {
+                return
+            } catch {
+                if isCurrentNavigation(request) {
+                    finishNavigation(request, clearTarget: true)
                 }
             }
         }
@@ -404,69 +484,263 @@ struct DetailView: View {
 
     private func handleArtistNavigation(_ artistId: String?) {
         guard let artistId else {
-            isLoadingNavigation = false
+            cancelNavigation(target: .artist)
+            return
+        }
+        let request = beginNavigation(target: .artist(artistId))
+        guard isCurrentNavigation(request) else {
+            finishNavigation(request, clearTarget: true)
             return
         }
 
         // Find artist in loaded artists
         if let artist = appState.artists.first(where: { $0.id == artistId }) {
-            // Found - navigate
-            Task { @MainActor in
-                // Clear path first if we're on a different section
-                if appState.selectedSidebarItem != .artists {
-                    appState.detailNavigationPath = NavigationPath()
+            navigationTask = Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .milliseconds(50))
+                    try Task.checkCancellation()
+                } catch {
+                    return
                 }
-                // Small delay to let NavigationStack settle after sidebar change
-                try? await Task.sleep(for: .milliseconds(50))
-                appState.detailNavigationPath.append(artist)
-                appState.navigationTargetArtistId = nil
-                isLoadingNavigation = false
+                guard isCurrentNavigation(request) else {
+                    finishNavigation(request, clearTarget: true)
+                    return
+                }
+                pushArtist(artist)
+                finishNavigation(request, clearTarget: true)
             }
         } else if appState.artists.isEmpty {
             // Artists not loaded yet - trigger fetch and show loading
             isLoadingNavigation = true
-            Task {
+            navigationTask = Task { @MainActor in
                 do {
-                    let artists = try await appState.networkActor.fetchArtists()
-                    await MainActor.run {
-                        appState.artists = artists
-                        // onChange handler will retry navigation automatically
+                    guard let serverID = request.serverID else {
+                        finishNavigation(request, clearTarget: true)
+                        return
                     }
+                    let artists = try await appState.networkActor.fetchArtists(expectedServerID: serverID)
+                    try Task.checkCancellation()
+                    guard isCurrentNavigation(request) else {
+                        finishNavigation(request, clearTarget: true)
+                        return
+                    }
+                    appState.artists = artists
+                    guard let artist = artists.first(where: { $0.id == artistId }) else {
+                        finishNavigation(request, clearTarget: true)
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(50))
+                    try Task.checkCancellation()
+                    guard isCurrentNavigation(request) else {
+                        finishNavigation(request, clearTarget: true)
+                        return
+                    }
+                    pushArtist(artist)
+                    finishNavigation(request, clearTarget: true)
+                } catch is CancellationError {
+                    return
                 } catch {
-                    // Fetch failed - clear pending navigation
-                    await MainActor.run {
-                        appState.navigationTargetArtistId = nil
-                        isLoadingNavigation = false
-                    }
+                    finishNavigation(request, clearTarget: true)
                 }
             }
         } else {
             // Artists loaded but artist not found - clear after brief timeout
             // (artist may have been deleted from server)
-            Task {
-                try? await Task.sleep(for: .milliseconds(500))
-                await MainActor.run {
-                    if appState.navigationTargetArtistId == artistId {
-                        appState.navigationTargetArtistId = nil
-                        isLoadingNavigation = false
-                    }
+            navigationTask = Task { @MainActor in
+                do {
+                    try await Task.sleep(for: .milliseconds(500))
+                    try Task.checkCancellation()
+                } catch {
+                    return
                 }
+                guard isCurrentNavigation(request) else {
+                    finishNavigation(request, clearTarget: true)
+                    return
+                }
+                finishNavigation(request, clearTarget: true)
             }
+        }
+    }
+
+    private func beginNavigation(target: NavigationTarget) -> PendingNavigation {
+        navigationTask?.cancel()
+        let previousOrigin = pendingNavigation.flatMap { $0.target == target ? $0 : nil }
+        let originSidebar = previousOrigin?.sidebar ?? appState.selectedSidebarItem
+        let originServerID: UUID?
+        if let previousOrigin {
+            originServerID = previousOrigin.serverID
+        } else {
+            originServerID = appState.activeServer?.id
+        }
+        let request = PendingNavigation(
+            target: target,
+            sidebar: originSidebar,
+            serverID: originServerID,
+            generation: UUID()
+        )
+        pendingNavigation = request
+        navigationTask = nil
+        isLoadingNavigation = false
+        switch target {
+        case .album:
+            appState.navigationTargetArtistId = nil
+        case .artist:
+            appState.navigationTargetAlbumId = nil
+        }
+        return request
+    }
+
+    private func isCurrentNavigation(_ request: PendingNavigation) -> Bool {
+        guard pendingNavigation == request,
+              appState.selectedSidebarItem == request.sidebar,
+              appState.activeServer?.id == request.serverID else { return false }
+        switch request.target {
+        case .album(let id): return appState.navigationTargetAlbumId == id
+        case .artist(let id): return appState.navigationTargetArtistId == id
+        }
+    }
+
+    private func pushAlbum(_ album: Album) {
+        if appState.selectedSidebarItem != .albums {
+            appState.detailNavigationPath = NavigationPath()
+        }
+        appState.detailNavigationPath.append(album)
+    }
+
+    private func pushArtist(_ artist: Artist) {
+        if appState.selectedSidebarItem != .artists {
+            appState.detailNavigationPath = NavigationPath()
+        }
+        appState.detailNavigationPath.append(artist)
+    }
+
+    private func cancelNavigation(target: NavigationTargetKind) {
+        guard let pendingNavigation else { return }
+        switch (pendingNavigation.target, target) {
+        case (.album, .album), (.artist, .artist): break
+        default: return
+        }
+        finishNavigation(pendingNavigation, clearTarget: false)
+    }
+
+    private func finishNavigation(_ request: PendingNavigation, clearTarget: Bool) {
+        guard pendingNavigation == request else { return }
+        navigationTask?.cancel()
+        navigationTask = nil
+        pendingNavigation = nil
+        isLoadingNavigation = false
+        guard clearTarget else { return }
+        switch request.target {
+        case .album(let id):
+            if appState.navigationTargetAlbumId == id { appState.navigationTargetAlbumId = nil }
+        case .artist(let id):
+            if appState.navigationTargetArtistId == id { appState.navigationTargetArtistId = nil }
         }
     }
 }
 
 private struct NowPlayingBarInset: View {
+    let contentLeading: CGFloat
+
     var body: some View {
-        // No GeometryReader and no fixed height: the bar's intrinsic height
-        // (54pt) plus the padding below measures deterministically, so the
-        // safe-area inset reserves exactly the space the bar occupies.
-        NowPlayingBar()
-            .frame(maxWidth: 920)
-            .frame(maxWidth: .infinity)
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-            .padding(.bottom, 12)
+        // Music 1.7 state 50: the accessory begins at the allocated sidebar
+        // edge (213), not the inset content origin (223). Its glass host is
+        // centered in that remaining region and sits 19 points above bottom.
+        // Read the live split allocation so resizing/collapse does not retain
+        // the old constant +107 offset. Native inspector-open positioning is
+        // still a separate proof obligation.
+        GeometryReader { geometry in
+            NowPlayingBar()
+                .frame(width: 700, height: 54)
+                .position(
+                    x: ((geometry.size.width + contentLeading) / 2).rounded(),
+                    y: 36
+                )
+        }
+        .frame(height: 82)
+    }
+}
+
+/// Measures the allocated split item, not the sidebar list's inset bounds or
+/// a saved ideal width. The probe never changes split-view layout or defaults.
+private struct SidebarAllocationProbe: NSViewRepresentable {
+    let onChange: (CGFloat) -> Void
+
+    func makeNSView(context: Context) -> AllocationView {
+        let view = AllocationView()
+        view.onChange = onChange
+        return view
+    }
+
+    func updateNSView(_ nsView: AllocationView, context: Context) {
+        nsView.onChange = onChange
+        nsView.scheduleMeasurement()
+    }
+
+    final class AllocationView: NSView {
+        var onChange: ((CGFloat) -> Void)?
+        private var measurementScheduled = false
+        private var lastTrailingEdge: CGFloat?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            NotificationCenter.default.removeObserver(self)
+            guard let window else { return }
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(splitGeometryChanged),
+                name: NSSplitView.didResizeSubviewsNotification, object: nil
+            )
+            NotificationCenter.default.addObserver(
+                self, selector: #selector(splitGeometryChanged),
+                name: NSWindow.didResizeNotification, object: window
+            )
+            scheduleMeasurement()
+        }
+
+        override func layout() {
+            super.layout()
+            scheduleMeasurement()
+        }
+
+        @objc private func splitGeometryChanged(_ notification: Notification) {
+            scheduleMeasurement()
+        }
+
+        func scheduleMeasurement() {
+            guard !measurementScheduled else { return }
+            measurementScheduled = true
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.measurementScheduled = false
+                self.measureAllocation()
+            }
+        }
+
+        private func measureAllocation() {
+            guard let root = window?.contentView else { return }
+            var child: NSView = self
+            while let parent = child.superview {
+                if let split = parent as? NSSplitView, split.isVertical {
+                    let trailingEdge: CGFloat
+                    if child.isHiddenOrHasHiddenAncestor || split.isSubviewCollapsed(child) {
+                        trailingEdge = 0
+                    } else {
+                        // The following item's origin includes the actual
+                        // divider allocation without guessing its thickness.
+                        let following = split.subviews.first {
+                            $0 !== child && !$0.isHidden && $0.frame.minX >= child.frame.maxX
+                        }
+                        trailingEdge = following.map { $0.convert($0.bounds, to: root).minX }
+                            ?? child.convert(child.bounds, to: root).maxX
+                    }
+                    guard trailingEdge != lastTrailingEdge else { return }
+                    lastTrailingEdge = trailingEdge
+                    onChange?(max(0, trailingEdge))
+                    return
+                }
+                child = parent
+            }
+        }
     }
 }
 

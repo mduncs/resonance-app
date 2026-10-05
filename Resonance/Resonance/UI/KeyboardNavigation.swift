@@ -9,8 +9,11 @@ struct GridNavigator {
 
     func navigate(from currentIndex: Int?, direction: KeyEquivalent) -> Int? {
         guard itemCount > 0 else { return nil }
-
-        let current = currentIndex ?? 0
+        // Starting keyboard navigation should land on the first item. Treating
+        // nil as index zero and then applying the arrow skipped the first item
+        // (and could jump an entire row on Down).
+        guard let currentIndex else { return 0 }
+        let current = min(max(currentIndex, 0), itemCount - 1)
 
         switch direction {
         case .leftArrow:
@@ -89,6 +92,7 @@ struct FocusableGridItem<Content: View>: View {
 
 /// A LazyVGrid with built-in keyboard navigation
 struct KeyboardNavigableGrid<Item: Identifiable, ItemContent: View>: View {
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     let items: [Item]
     let columns: [GridItem]
     let spacing: CGFloat
@@ -97,7 +101,18 @@ struct KeyboardNavigableGrid<Item: Identifiable, ItemContent: View>: View {
     let itemContent: (Item) -> ItemContent
 
     @FocusState private var focusedId: Item.ID?
-    @State private var estimatedColumnsPerRow: Int = 4
+    @State private var viewportWidth: CGFloat = 0
+
+    private var estimatedColumnsPerRow: Int {
+        guard columns.count == 1, let column = columns.first,
+              case .adaptive(let minimum, _) = column.size else {
+            return max(1, columns.count)
+        }
+
+        guard viewportWidth > 0 else { return 1 }
+        let columnSpacing = column.spacing ?? 8
+        return max(1, Int((viewportWidth + columnSpacing) / (minimum + columnSpacing)))
+    }
 
     init(
         items: [Item],
@@ -142,6 +157,15 @@ struct KeyboardNavigableGrid<Item: Identifiable, ItemContent: View>: View {
                 }
                 .padding()
             }
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { viewportWidth = geometry.size.width }
+                        .onChange(of: geometry.size.width) { _, width in
+                            viewportWidth = width
+                        }
+                }
+            }
             .focusable()
             .focusEffectDisabled()
             .onKeyPress(keys: [.leftArrow, .rightArrow, .upArrow, .downArrow]) { press in
@@ -177,7 +201,7 @@ struct KeyboardNavigableGrid<Item: Identifiable, ItemContent: View>: View {
             let newId = items[newIndex].id
             selectedId = newId
             focusedId = newId
-            withAnimation {
+            withAnimation(reduceMotion ? nil : .easeInOut(duration: 0.15)) {
                 proxy.scrollTo(newId, anchor: .center)
             }
             return .handled
@@ -204,186 +228,67 @@ extension View {
 struct GlobalKeyboardShortcuts: ViewModifier {
     @Environment(AppState.self) private var appState
 
-    // Volume step sizes
+    // MARK: Routing contract
+    //
+    // Command-key equivalents are owned by the app menu registries in
+    // ResonanceApp.swift (Playback/View/Song/File) and dispatch before this
+    // modifier ever sees the event; duplicating them here creates silent
+    // second routes that drift apart. This modifier therefore carries only
+    // bindings no menu declares: unmodified transport keys, ⌘R repeat
+    // cycling, and Delete-to-remove in the visible queue.
+
+    /// True while the user is typing into a text control. Unmodified keys
+    /// must yield to text entry instead of scrubbing playback, stepping
+    /// volume, or deleting queue items underneath the field editor.
+    private var isTextEntryActive: Bool {
+        NSApp.keyWindow?.firstResponder is NSTextView
+    }
+
+    // Transport step sizes
     private let smallVolumeStep: Float = 0.05  // 5%
-    private let largeVolumeStep: Float = 0.15  // 15%
-    // Seek step size
     private let seekStep: TimeInterval = 5.0  // 5 seconds
 
     func body(content: Content) -> some View {
         content
-            // Space: Play/Pause
+            // Space: play/pause. Bare Space appears in no menu, so this is
+            // the only route.
             .onKeyPress(.space, phases: .down) { _ in
+                guard !isTextEntryActive else { return .ignored }
                 Task { await appState.playbackManager.togglePlayPause() }
                 return .handled
             }
-            // Command+Left: Previous track
+            // Left arrow: seek back five seconds
             .onKeyPress(.leftArrow, phases: .down) { press in
-                if press.modifiers.contains(.command) {
-                    Task { await appState.playbackManager.previous() }
-                    return .handled
-                }
-                return .ignored
+                guard press.modifiers.isEmpty, !isTextEntryActive else { return .ignored }
+                let newTime = max(0, appState.currentTime - seekStep)
+                Task { await appState.playbackManager.seek(to: newTime) }
+                return .handled
             }
-            // Command+Right: Next track
+            // Right arrow: seek forward five seconds
             .onKeyPress(.rightArrow, phases: .down) { press in
-                if press.modifiers.contains(.command) {
-                    Task { await appState.playbackManager.next() }
-                    return .handled
-                }
-                return .ignored
+                guard press.modifiers.isEmpty, !isTextEntryActive else { return .ignored }
+                let newTime = min(appState.duration, appState.currentTime + seekStep)
+                Task { await appState.playbackManager.seek(to: newTime) }
+                return .handled
             }
-            // Left arrow (no modifier): Seek back 5 seconds
-            .onKeyPress(.leftArrow, phases: .down) { press in
-                if press.modifiers.isEmpty {
-                    let newTime = max(0, appState.currentTime - seekStep)
-                    Task { await appState.playbackManager.seek(to: newTime) }
-                    return .handled
-                }
-                return .ignored
-            }
-            // Right arrow (no modifier): Seek forward 5 seconds
-            .onKeyPress(.rightArrow, phases: .down) { press in
-                if press.modifiers.isEmpty {
-                    let newTime = min(appState.duration, appState.currentTime + seekStep)
-                    Task { await appState.playbackManager.seek(to: newTime) }
-                    return .handled
-                }
-                return .ignored
-            }
-            // Up arrow: Volume up (small step)
+            // Up/down arrows: volume in small steps. The Playback menu owns
+            // ⌘↑/⌘↓ for the large step.
             .onKeyPress(.upArrow, phases: .down) { press in
-                if press.modifiers.isEmpty {
-                    appState.volume = min(1.0, appState.volume + smallVolumeStep)
-                    return .handled
-                }
-                return .ignored
+                guard press.modifiers.isEmpty, !isTextEntryActive else { return .ignored }
+                appState.volume = min(1.0, appState.volume + smallVolumeStep)
+                return .handled
             }
-            // Down arrow: Volume down (small step)
             .onKeyPress(.downArrow, phases: .down) { press in
-                if press.modifiers.isEmpty {
-                    appState.volume = max(0, appState.volume - smallVolumeStep)
-                    return .handled
-                }
-                return .ignored
+                guard press.modifiers.isEmpty, !isTextEntryActive else { return .ignored }
+                appState.volume = max(0, appState.volume - smallVolumeStep)
+                return .handled
             }
-            // Command+Up: Volume up (large step)
-            .onKeyPress(.upArrow, phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.volume = min(1.0, appState.volume + largeVolumeStep)
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+Down: Volume down (large step)
-            .onKeyPress(.downArrow, phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.volume = max(0, appState.volume - largeVolumeStep)
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+L: Toggle lyrics panel
-            .onKeyPress(keys: [KeyEquivalent("l")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.option) && !press.modifiers.contains(.shift) {
-                    appState.isLyricsPanelVisible.toggle()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+Option+Right: Toggle queue panel
-            .onKeyPress(.rightArrow, phases: .down) { press in
-                if press.modifiers.contains(.command) && press.modifiers.contains(.option) {
-                    appState.isQueueVisible.toggle()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+F: Focus search
-            .onKeyPress(keys: [KeyEquivalent("f")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.shouldFocusSearch = true
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+S: Toggle shuffle
-            .onKeyPress(keys: [KeyEquivalent("s")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.shuffleEnabled.toggle()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+R: Cycle repeat mode
-            .onKeyPress(keys: [KeyEquivalent("r")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.playbackManager.cycleRepeatMode()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+0: Toggle MiniPlayer
-            .onKeyPress(keys: [KeyEquivalent("0")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.showMiniPlayer()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+Shift+F: Toggle fullscreen/immersive mode
-            .onKeyPress(keys: [KeyEquivalent("f")], phases: .down) { press in
-                if press.modifiers.contains(.command) && press.modifiers.contains(.shift) {
-                    appState.enterImmersiveMode()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+N: New playlist
-            .onKeyPress(keys: [KeyEquivalent("n")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    appState.createPlaylistSongIds = []
-                    appState.showCreatePlaylistSheet = true
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+I: Get info for now playing
-            .onKeyPress(keys: [KeyEquivalent("i")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    if let song = appState.nowPlaying {
-                        appState.getInfoContent = .song(song)
-                    }
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+M: Minimize window
-            .onKeyPress(keys: [KeyEquivalent("m")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    NSApp.keyWindow?.miniaturize(nil)
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+W: Close window
-            .onKeyPress(keys: [KeyEquivalent("w")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    NSApp.keyWindow?.close()
-                    return .handled
-                }
-                return .ignored
-            }
-            // Command+.: Stop playback
-            .onKeyPress(keys: [KeyEquivalent(".")], phases: .down) { press in
-                if press.modifiers.contains(.command) && !press.modifiers.contains(.shift) {
-                    Task { await appState.playbackManager.stop() }
-                    return .handled
-                }
-                return .ignored
-            }
-            // Delete/Backspace: Remove selected item from queue
+            // Delete: remove the selected queue item, but only while the
+            // queue inspector is open and nothing is being typed. A bare
+            // Delete elsewhere in the app must never mutate the queue.
             .onKeyPress(.delete, phases: .down) { _ in
+                guard !isTextEntryActive,
+                      appState.nowPlayingInspector == .queue else { return .ignored }
                 appState.removeSelectedQueueItem()
                 return .handled
             }
@@ -425,45 +330,53 @@ struct MouseNavigationView: NSViewRepresentable {
     func updateNSView(_ nsView: MouseNavigationNSView, context: Context) {
         nsView.appState = appState
     }
+
+    static func dismantleNSView(_ nsView: MouseNavigationNSView, coordinator: ()) {
+        nsView.stopMonitoring()
+    }
 }
 
 class MouseNavigationNSView: NSView {
     var appState: AppState?
     private var monitor: Any?
 
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        if window != nil && monitor == nil {
-            // Monitor for mouse button events globally within the app
+        stopMonitoring()
+        if window != nil {
             monitor = NSEvent.addLocalMonitorForEvents(matching: .otherMouseDown) { [weak self] event in
-                self?.handleMouseButton(event)
-                return event
+                guard let self, event.window === self.window,
+                      self.window?.attachedSheet == nil else { return event }
+                return self.navigate(mouseButton: event.buttonNumber) ? nil : event
             }
         }
     }
 
     override func removeFromSuperview() {
+        stopMonitoring()
+        super.removeFromSuperview()
+    }
+
+    func stopMonitoring() {
         if let monitor = monitor {
             NSEvent.removeMonitor(monitor)
             self.monitor = nil
         }
-        super.removeFromSuperview()
     }
 
-    private func handleMouseButton(_ event: NSEvent) {
-        guard let appState = appState else { return }
-
-        switch event.buttonNumber {
+    @discardableResult
+    func navigate(mouseButton: Int) -> Bool {
+        guard let appState else { return false }
+        switch mouseButton {
         case 3: // Mouse button 4 (back)
-            if !appState.detailNavigationPath.isEmpty {
-                appState.detailNavigationPath.removeLast()
-            }
+            appState.navigateBack()
         case 4: // Mouse button 5 (forward)
-            // Forward navigation would require history tracking
-            // For now, this is a no-op
-            break
+            appState.navigateForward()
         default:
-            break
+            return false
         }
+        return true
     }
 }

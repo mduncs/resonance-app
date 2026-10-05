@@ -11,6 +11,11 @@ struct CreatePlaylistSheet: View {
     @State private var description = ""
     @State private var isPublic = false
     @State private var isCreating = false
+    @State private var createdPlaylistID: String?
+    @State private var creationServerID: UUID?
+    @State private var hasSavedDetails = false
+
+    private var hasCreatedPlaylist: Bool { createdPlaylistID != nil }
     @State private var errorMessage: String?
 
     var body: some View {
@@ -21,9 +26,11 @@ struct CreatePlaylistSheet: View {
                     TextField("Description (optional)", text: $description, axis: .vertical)
                         .lineLimit(3...6)
                 }
+                .disabled(isCreating || hasCreatedPlaylist)
 
                 Section {
                     Toggle("Public", isOn: $isPublic)
+                        .disabled(isCreating || hasCreatedPlaylist)
                 } footer: {
                     Text("Public playlists can be seen by other users on your server.")
                 }
@@ -39,16 +46,16 @@ struct CreatePlaylistSheet: View {
             .navigationTitle("New Playlist")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+                    Button(hasCreatedPlaylist ? "Close" : "Cancel") {
                         dismiss()
                     }
                 }
 
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Create") {
+                    Button(hasCreatedPlaylist ? (hasSavedDetails ? "Retry Refresh" : "Retry Save") : "Create") {
                         createPlaylist()
                     }
-                    .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || isCreating)
+                    .disabled(isCreating || (!hasCreatedPlaylist && name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty))
                 }
             }
         }
@@ -56,29 +63,45 @@ struct CreatePlaylistSheet: View {
     }
 
     private func createPlaylist() {
+        let submittedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isCreating, hasCreatedPlaylist || !submittedName.isEmpty else { return }
+        guard let serverID = hasCreatedPlaylist ? creationServerID : appState.activeServer?.id,
+              serverID == appState.activeServer?.id else {
+            errorMessage = "Return to the server where this playlist was started before retrying."
+            return
+        }
+        creationServerID = serverID
+        let submittedSongIds = initialSongIds
+        let submittedDescription = description
+        let submittedPublic = isPublic
         isCreating = true
         errorMessage = nil
 
         Task {
+            defer { isCreating = false }
             do {
-                try await appState.networkActor.createPlaylist(name: name, songIds: initialSongIds)
-
-                // Refresh playlists list
-                let playlists = try await appState.networkActor.fetchPlaylists()
-                await MainActor.run {
-                    appState.playlists = playlists
-                    dismiss()
+                if !hasCreatedPlaylist {
+                    createdPlaylistID = try await appState.networkActor.createPlaylist(
+                        name: submittedName, songIds: submittedSongIds, expectedServerID: serverID
+                    )
                 }
-            } catch let error as ResonanceError {
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    isCreating = false
+                if !hasSavedDetails, let createdPlaylistID {
+                    try await appState.networkActor.updatePlaylist(
+                        id: createdPlaylistID, comment: submittedDescription, isPublic: submittedPublic,
+                        expectedServerID: serverID
+                    )
+                    hasSavedDetails = true
                 }
+                let playlists = try await appState.networkActor.fetchPlaylists(forceRefresh: true, expectedServerID: serverID)
+                guard appState.activeServer?.id == serverID else { throw ResonanceError.notConfigured }
+                appState.playlists = playlists
+                dismiss()
             } catch {
-                await MainActor.run {
-                    errorMessage = "Failed to create playlist: \(error.localizedDescription)"
-                    isCreating = false
-                }
+                errorMessage = hasCreatedPlaylist
+                    ? (hasSavedDetails
+                        ? "The playlist was created, but the list couldn't be refreshed: \(error.localizedDescription)"
+                        : "The playlist was created, but its description and visibility couldn't be saved: \(error.localizedDescription)")
+                    : "Failed to create playlist: \(error.localizedDescription)"
             }
         }
     }
@@ -140,15 +163,18 @@ struct EditPlaylistSheet: View {
     }
 
     private func savePlaylist() {
+        let submittedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !submittedName.isEmpty, !isSaving else { return }
+        let submittedComment = comment
         isSaving = true
         errorMessage = nil
 
         Task {
             do {
-                try await appState.networkActor.updatePlaylist(id: playlist.id, name: name, comment: comment.isEmpty ? nil : comment)
+                try await appState.networkActor.updatePlaylist(id: playlist.id, name: submittedName, comment: submittedComment)
 
                 // Refresh playlists list
-                let playlists = try await appState.networkActor.fetchPlaylists()
+                let playlists = try await appState.networkActor.fetchPlaylists(forceRefresh: true)
                 await MainActor.run {
                     appState.playlists = playlists
                     dismiss()

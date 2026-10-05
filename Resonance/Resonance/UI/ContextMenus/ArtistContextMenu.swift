@@ -37,30 +37,15 @@ struct ArtistContextMenu: View {
         Divider()
 
         // Playlists
-        Menu {
-            ForEach(appState.playlists) { playlist in
-                Button {
-                    Task {
-                        await addArtistToPlaylist(playlist)
-                    }
-                } label: {
-                    Label(playlist.name, systemImage: "music.note.list")
-                }
+        PlaylistDestinationMenu(onSelect: { playlist in
+            Task { await addArtistToPlaylist(playlist) }
+        }, onBrowse: {
+            appState.choosePlaylist {
+                try await appState.playableArtistSongs(for: artist).map(\.id)
             }
-
-            Divider()
-
-            Button {
-                Task {
-                    await createPlaylistWithArtistSongs()
-                }
-            } label: {
-                Label("New Playlist...", systemImage: "plus")
-            }
-        } label: {
-            Label("Add to Playlist", systemImage: "text.badge.plus")
-        }
-
+        }, onCreate: {
+            Task { await createPlaylistWithArtistSongs() }
+        })
         Divider()
 
         // Radio

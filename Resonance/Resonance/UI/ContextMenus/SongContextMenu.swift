@@ -4,9 +4,36 @@ import AppKit
 struct SongContextMenu: View {
     @Environment(AppState.self) private var appState
     let song: Song
+    enum DownloadState {
+        case absent
+        case downloaded(URL)
+    }
+    var downloadState: DownloadState? = nil
     @State private var cachedFilePath: URL?
+    @State private var cachedIdentity: CacheIdentity?
     @State private var songIsHidden = false
     @State private var songIsLiked = false
+
+    private struct CacheIdentity: Hashable {
+        let serverId: UUID?
+        let songId: String
+        let suffix: String
+        let revision: UInt64
+    }
+
+    private var cacheIdentity: CacheIdentity {
+        let serverId = appState.activeServerId.flatMap(UUID.init(uuidString:))
+        return CacheIdentity(serverId: serverId, songId: song.id, suffix: song.suffix,
+                             revision: serverId.map { appState.cacheActor.downloadProgress.manifestRevisions[$0, default: 0] } ?? 0)
+    }
+
+    private var downloadedFilePath: URL? {
+        switch downloadState {
+        case .absent: return nil
+        case .downloaded(let url): return url
+        case nil: return cachedIdentity == cacheIdentity ? cachedFilePath : nil
+        }
+    }
 
     var body: some View {
         // Playback
@@ -42,29 +69,14 @@ struct SongContextMenu: View {
         Divider()
 
         // Playlists
-        Menu {
-            ForEach(appState.playlists) { playlist in
-                Button {
-                    Task {
-                        await addToPlaylist(song, playlist: playlist)
-                    }
-                } label: {
-                    Label(playlist.name, systemImage: "music.note.list")
-                }
-            }
-
-            Divider()
-
-            Button {
-                appState.createPlaylistSongIds = [song.id]
-                appState.showCreatePlaylistSheet = true
-            } label: {
-                Label("New Playlist...", systemImage: "plus")
-            }
-        } label: {
-            Label("Add to Playlist", systemImage: "text.badge.plus")
-        }
-
+        PlaylistDestinationMenu(onSelect: { playlist in
+            Task { await addToPlaylist(song, playlist: playlist) }
+        }, onBrowse: {
+            appState.choosePlaylist(itemCount: 1) { [song] in [song.id] }
+        }, onCreate: {
+            appState.createPlaylistSongIds = [song.id]
+            appState.showCreatePlaylistSheet = true
+        })
         Divider()
 
         // Navigation
@@ -122,10 +134,13 @@ struct SongContextMenu: View {
             }
 
             // Download actions
-            if cachedFilePath != nil {
+            if downloadedFilePath != nil {
                 Button {
-                    if let path = cachedFilePath {
-                        NSWorkspace.shared.selectFile(path.path, inFileViewerRootedAtPath: "")
+                    if let path = downloadedFilePath {
+                        NSWorkspace.shared.selectFile(
+                            path.path,
+                            inFileViewerRootedAtPath: path.deletingLastPathComponent().path
+                        )
                     }
                 } label: {
                     Label("Show in Finder", systemImage: "folder")
@@ -159,8 +174,11 @@ struct SongContextMenu: View {
                 Label("Delete from Library", systemImage: "trash")
             }
         }
-        .task {
+        .task(id: cacheIdentity) {
             await updateCachedFilePath()
+            guard !Task.isCancelled else { return }
+            songIsHidden = false
+            songIsLiked = false
             if let serverId = appState.activeServerId {
                 songIsHidden = (try? appState.databaseManager.isHidden(id: song.id, type: "song", serverId: serverId)) ?? false
                 songIsLiked = (try? appState.databaseManager.isLiked(id: song.id, type: "song", serverId: serverId)) ?? false
@@ -171,16 +189,21 @@ struct SongContextMenu: View {
     // MARK: - Actions
 
     private func updateCachedFilePath() async {
-        guard let server = await appState.networkActor.activeServer else {
+        let identity = cacheIdentity
+        guard let serverId = identity.serverId else {
             cachedFilePath = nil
+            cachedIdentity = identity
             return
         }
 
-        cachedFilePath = await appState.cacheActor.getDownloadedAudioPath(
-            for: song.id,
-            serverId: server.id,
-            preferredSuffix: song.suffix
+        let path = await appState.cacheActor.getDownloadedAudioPath(
+            for: identity.songId,
+            serverId: serverId,
+            preferredSuffix: identity.suffix
         )
+        guard !Task.isCancelled, identity == cacheIdentity else { return }
+        cachedFilePath = path
+        cachedIdentity = identity
     }
 
     private func addToPlaylist(_ song: Song, playlist: Playlist) async {
@@ -196,12 +219,16 @@ struct SongContextMenu: View {
 
     private func navigateToAlbum(_ albumId: String) {
         // Set navigation target and switch to albums view
+        appState.navigationTargetSongId = nil
+        appState.navigationTargetArtistId = nil
         appState.navigationTargetAlbumId = albumId
         appState.selectedSidebarItem = .albums
     }
 
     private func navigateToArtist(_ artistId: String) {
         // Set navigation target and switch to artists view
+        appState.navigationTargetAlbumId = nil
+        appState.navigationTargetSongId = nil
         appState.navigationTargetArtistId = artistId
         appState.selectedSidebarItem = .artists
     }
@@ -326,10 +353,10 @@ struct SongContextMenu: View {
     }
 
     private func removeDownload(_ song: Song) async {
-        guard let server = await appState.networkActor.activeServer else { return }
+        guard let serverId = appState.activeServerId.flatMap(UUID.init(uuidString:)) else { return }
 
         // Delete the download and its metadata
-        await appState.cacheActor.deleteDownload(songId: song.id, serverId: server.id)
+        await appState.cacheActor.deleteDownload(songId: song.id, serverId: serverId)
         cachedFilePath = nil
     }
 }

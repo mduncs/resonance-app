@@ -232,7 +232,7 @@ final class PathMatchKeyTests: XCTestCase {
             sourceCollectionKey: "collection:test",
             sourceKind: "apple_playlist",
             sourceDisplayName: key,
-            downloadSource: "gamdl",
+            downloadSource: "fetcher",
             queryContext: nil,
             acquiredAt: nil,
             contractVersion: 1

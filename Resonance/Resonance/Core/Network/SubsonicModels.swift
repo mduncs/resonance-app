@@ -116,7 +116,9 @@ struct SubsonicAlbum: Decodable {
     let genre: String?
     let coverArt: String?
     let starred: Date?
+    let created: Date?
     let userRating: Int?
+    var releaseDate: MediaReleaseDate? = nil
 
     func toAlbum() -> Album {
         Album(
@@ -130,7 +132,9 @@ struct SubsonicAlbum: Decodable {
             genre: genre,
             coverArt: coverArt,
             starred: starred,
-            rating: userRating
+            rating: userRating,
+            addedAt: created,
+            releaseDate: MediaReleaseDate(storageValue: releaseDate?.storageValue)
         )
     }
 }
@@ -147,7 +151,20 @@ struct AlbumResponse: SubsonicContent, Decodable {
     let genre: String?
     let coverArt: String?
     let starred: Date?
+    let created: Date?
+    let userRating: Int?
     let song: [SubsonicSong]?
+    var releaseDate: MediaReleaseDate? = nil
+
+    func toAlbum() -> Album {
+        Album(
+            id: id, name: name, artist: artist ?? "Unknown Artist",
+            artistId: artistId ?? "", songCount: songCount ?? 0,
+            duration: duration ?? 0, year: year, genre: genre,
+            coverArt: coverArt, starred: starred, rating: userRating, addedAt: created,
+            releaseDate: MediaReleaseDate(storageValue: releaseDate?.storageValue)
+        )
+    }
 }
 
 struct SubsonicSong: Decodable {
@@ -168,8 +185,11 @@ struct SubsonicSong: Decodable {
     let coverArt: String?
     let starred: Date?
     let userRating: Int?
+    var playCount: Int? = nil
+    var created: Date? = nil
     let replayGain: SubsonicReplayGain?
     let path: String?
+    var groupings: [String]? = nil
 
     func toSong() -> Song {
         Song(
@@ -191,7 +211,10 @@ struct SubsonicSong: Decodable {
             starred: starred,
             rating: userRating,
             replayGain: replayGain?.toReplayGain(),
-            path: path
+            path: path,
+            playCount: playCount,
+            addedAt: created,
+            groupings: groupings
         )
     }
 }
@@ -243,6 +266,11 @@ struct SubsonicPlaylist: Decodable {
             isPublic: `public` ?? false
         )
     }
+}
+
+struct CreatedPlaylistResponse: SubsonicContent, Decodable {
+    static let contentKey = "playlist"
+    let id: String
 }
 
 struct PlaylistResponse: SubsonicContent, Decodable {
@@ -500,6 +528,8 @@ struct SubsonicDirectoryChild: Decodable {
     let coverArt: String?
     let starred: Date?
     let userRating: Int?
+    var playCount: Int? = nil
+    var created: Date? = nil
     let replayGain: SubsonicReplayGain?
 
     func toDirectoryChild() -> DirectoryChild {
@@ -524,7 +554,9 @@ struct SubsonicDirectoryChild: Decodable {
                 coverArt: coverArt,
                 starred: starred,
                 rating: userRating,
-                replayGain: replayGain?.toReplayGain()
+                replayGain: replayGain?.toReplayGain(),
+                playCount: playCount,
+                addedAt: created
             )
             return .song(song)
         }
@@ -613,8 +645,11 @@ struct SongResponse: SubsonicContent, Decodable {
     let coverArt: String?
     let starred: Date?
     let userRating: Int?
+    var playCount: Int? = nil
+    var created: Date? = nil
     let replayGain: SubsonicReplayGain?
     let path: String?
+    var groupings: [String]? = nil
 
     func toSong() -> Song {
         Song(
@@ -636,7 +671,10 @@ struct SongResponse: SubsonicContent, Decodable {
             starred: starred,
             rating: userRating,
             replayGain: replayGain?.toReplayGain(),
-            path: path
+            path: path,
+            playCount: playCount,
+            addedAt: created,
+            groupings: groupings
         )
     }
 }

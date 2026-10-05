@@ -5,11 +5,17 @@ struct ContinuePlayingPanel: View {
     @Environment(AppState.self) private var appState
     @Environment(\.emotionEngine) private var emotionEngine
     @State private var hoveredItemId: UUID?
+    @State private var dropTargetID: UUID?
+    /// Clear removes every upcoming item (up next, base remainder, autoplay),
+    /// so it confirms before destroying the rest of the queue identity.
+    @State private var isConfirmingClear = false
     private let sectionPreviewLimit = 80
     private let historyPreviewLimit = 50
 
     var body: some View {
         VStack(spacing: 0) {
+            playbackModes
+
             // Header
             header
 
@@ -17,16 +23,57 @@ struct ContinuePlayingPanel: View {
                 .padding(.horizontal)
 
             // Queue content
-            if appState.queueManager.isEmpty {
+            if appState.queueManager.isEmpty && appState.queueManager.history.isEmpty {
                 emptyState
             } else {
                 queueList
             }
         }
         .background(.ultraThinMaterial)
+        .confirmationDialog(
+            "Clear all upcoming songs?",
+            isPresented: $isConfirmingClear,
+            titleVisibility: .visible
+        ) {
+            Button("Clear", role: .destructive) {
+                appState.queueManager.clear()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("All \(appState.queueManager.allUpcomingCount) upcoming songs will be removed. The current song keeps playing.")
+        }
     }
 
     // MARK: - Header
+
+    // Aug22 capture13: AutoPlay button115×36 in a238-wide stack, gap8.
+    // The other native button is AutoMix, not equivalent to our crossfade.
+    // Its implementation remains a capability gap; do not substitute another mode.
+    private var playbackModes: some View {
+        HStack(spacing: 8) {
+            Button {
+                appState.isAutoPlayEnabled.toggle()
+            } label: {
+                Image(systemName: "infinity")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 22, height: 11)
+                    .frame(width: 115, height: 36)
+                    .background(.quaternary, in: Capsule())
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(appState.isAutoPlayEnabled ? Color.accentColor : .secondary)
+            .accessibilityLabel("AutoPlay")
+            .accessibilityValue(appState.isAutoPlayEnabled ? "On" : "Off")
+            .accessibilityIdentifier("Queue.AutoPlay")
+            .help("Automatically play similar songs when the queue ends")
+
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 10)
+        .padding(.top, 8)
+    }
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -40,11 +87,11 @@ struct ContinuePlayingPanel: View {
                 // Clear button
                 if appState.queueManager.allUpcomingCount > 0 {
                     Button("Clear") {
-                        appState.queueManager.clear()
+                        isConfirmingClear = true
                     }
                     .buttonStyle(.plain)
                     .font(.subheadline)
-                    .foregroundStyle(emotionEngine.primaryColor)
+                    .foregroundStyle(Color.accentColor)
                 }
             }
 
@@ -52,7 +99,7 @@ struct ContinuePlayingPanel: View {
             if let sourceName = queueSourceName {
                 Text("From \(sourceName)")
                     .font(.subheadline)
-                    .foregroundStyle(emotionEngine.primaryColor)
+                    .foregroundStyle(Color.accentColor)
                     .lineLimit(1)
             }
         }
@@ -116,6 +163,10 @@ struct ContinuePlayingPanel: View {
                         .onHover { isHovered in
                             hoveredItemId = isHovered ? current.id : nil
                         }
+                        .contextMenu {
+                            QuickCaptureMenu(song: current.song)
+                            Button("Get Info") { appState.getInfoContent = .song(current.song) }
+                        }
                     }
                 }
 
@@ -126,7 +177,8 @@ struct ContinuePlayingPanel: View {
                     sectionView(
                         title: "UP NEXT",
                         items: upNextItems,
-                        totalCount: upNextCount
+                        totalCount: upNextCount,
+                        allowsReorder: true
                     )
                 }
 
@@ -183,7 +235,7 @@ struct ContinuePlayingPanel: View {
 
     // MARK: - Section View
 
-    private func sectionView(title: String, items: [QueueItem], totalCount: Int) -> some View {
+    private func sectionView(title: String, items: [QueueItem], totalCount: Int, allowsReorder: Bool = false) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(title)
                 .font(.caption)
@@ -193,11 +245,39 @@ struct ContinuePlayingPanel: View {
                 .padding(.top, 16)
 
             ForEach(items) { item in
-                queueRow(item: item)
+                if allowsReorder {
+                    queueRow(item: item)
+                        .draggable(QueueItemTransfer(id: item.id, sourceIndex: 0))
+                        .dropDestination(for: QueueItemTransfer.self) { transfers, _ in
+                            guard transfers.count == 1, let transfer = transfers.first else { return false }
+                            return appState.queueManager.moveUpNextItem(id: transfer.id, onto: item.id)
+                        } isTargeted: { targeted in
+                            if targeted { dropTargetID = item.id }
+                            else if dropTargetID == item.id { dropTargetID = nil }
+                        }
+                        .overlay {
+                            if dropTargetID == item.id {
+                                RoundedRectangle(cornerRadius: 8)
+                                    .strokeBorder(Color.accentColor, lineWidth: 1)
+                                    .allowsHitTesting(false)
+                            }
+                        }
+                        .accessibilityAction(named: "Move Up") { moveManualItem(item.id, delta: -1) }
+                        .accessibilityAction(named: "Move Down") { moveManualItem(item.id, delta: 1) }
+                } else {
+                    queueRow(item: item)
+                }
             }
 
             QueueOverflowRow(hiddenCount: totalCount - items.count)
         }
+    }
+
+    private func moveManualItem(_ id: UUID, delta: Int) {
+        let items = appState.queueManager.upNextItems
+        guard let index = items.firstIndex(where: { $0.id == id }),
+              items.indices.contains(index + delta) else { return }
+        appState.queueManager.moveUpNextItem(id: id, onto: items[index + delta].id)
     }
 
     private func queueRow(item: QueueItem) -> some View {
@@ -233,22 +313,39 @@ struct ContinuePlayingPanel: View {
             Divider()
 
             Button {
+                appState.navigationTargetArtistId = nil
+                appState.navigationTargetSongId = nil
                 appState.navigationTargetAlbumId = item.song.albumId
                 appState.selectedSidebarItem = .albums
-                appState.isQueueVisible = false
+                appState.nowPlayingInspector = nil
             } label: {
                 Label("Go to Album", systemImage: "square.stack")
             }
             .disabled(item.song.albumId.isEmpty)
 
             Button {
+                appState.navigationTargetAlbumId = nil
+                appState.navigationTargetSongId = nil
                 appState.navigationTargetArtistId = item.song.artistId
                 appState.selectedSidebarItem = .artists
-                appState.isQueueVisible = false
+                appState.nowPlayingInspector = nil
             } label: {
                 Label("Go to Artist", systemImage: "music.mic")
             }
             .disabled(item.song.artistId.isEmpty)
+
+            Divider()
+
+            QuickCaptureMenu(song: item.song)
+
+            Button("Get Info") { appState.getInfoContent = .song(item.song) }
+
+            if let index = appState.queueManager.upNextItems.firstIndex(where: { $0.id == item.id }) {
+                Button("Move Up") { moveManualItem(item.id, delta: -1) }
+                    .disabled(index == 0)
+                Button("Move Down") { moveManualItem(item.id, delta: 1) }
+                    .disabled(index + 1 == appState.queueManager.upNextItems.count)
+            }
 
             Divider()
 
@@ -348,7 +445,7 @@ struct ContinuePlayingRow: View {
                     Button(role: .destructive) {
                         remove()
                     } label: {
-                        Label("Remove", systemImage: "minus.circle")
+                        Label("Remove from Queue", systemImage: "minus.circle")
                     }
                 }
             } label: {
@@ -370,6 +467,33 @@ struct ContinuePlayingRow: View {
                 .fill(isHovered && !isCurrent ? Color.primary.opacity(0.05) : Color.clear)
         )
         .animation(.easeInOut(duration: 0.15), value: isHovered)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(item.song.title), \(item.song.artist)\(isCurrent ? ", now playing" : "")")
+        .accessibilityHint(isCurrent ? "" : "Plays this song")
+        .modifier(ContinuePlayingRowAccessibilityActions(
+            isCurrent: isCurrent,
+            onPlay: onPlay,
+            onRemove: onRemove
+        ))
+    }
+}
+
+private struct ContinuePlayingRowAccessibilityActions: ViewModifier {
+    let isCurrent: Bool
+    let onPlay: () -> Void
+    let onRemove: (() -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isCurrent {
+            content
+        } else if let onRemove {
+            content
+                .accessibilityAction(named: "Play") { onPlay() }
+                .accessibilityAction(named: "Remove") { onRemove() }
+        } else {
+            content.accessibilityAction(named: "Play") { onPlay() }
+        }
     }
 }
 
@@ -409,7 +533,9 @@ struct HistorySection: View {
             .buttonStyle(.plain)
 
             if isExpanded {
-                ForEach(history.reversed()) { item in
+                // Key by position: repeated plays of one song can append
+                // history entries whose QueueItem ids repeat.
+                ForEach(Array(history.reversed().enumerated()), id: \.offset) { _, item in
                     HistoryRow(item: item)
                 }
                 QueueOverflowRow(hiddenCount: totalCount - history.count)
@@ -445,6 +571,8 @@ struct HistoryRow: View {
         }
         .padding(.horizontal, 16)
         .padding(.vertical, 4)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("\(item.song.title), \(item.song.artist), previously played")
         .contextMenu {
             Button {
                 Task {
@@ -467,6 +595,10 @@ struct HistoryRow: View {
             } label: {
                 Label("Add to Queue", systemImage: "text.badge.plus")
             }
+
+            Divider()
+            QuickCaptureMenu(song: item.song)
+            Button("Get Info") { appState.getInfoContent = .song(item.song) }
         }
     }
 }

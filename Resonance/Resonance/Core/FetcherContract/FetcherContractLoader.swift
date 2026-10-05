@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum FetcherContractLoaderError: LocalizedError, Equatable {
@@ -5,6 +6,7 @@ enum FetcherContractLoaderError: LocalizedError, Equatable {
     case unsupportedExportSchemaVersion(Int)
     case unsupportedContractVersion(Int)
     case unreadableDirectory(String)
+    case inconsistentExport(String)
 
     var errorDescription: String? {
         switch self {
@@ -16,6 +18,8 @@ enum FetcherContractLoaderError: LocalizedError, Equatable {
             return "Unsupported Fetcher contract version: \(version)"
         case let .unreadableDirectory(path):
             return "Fetcher contract directory is not readable: \(path)"
+        case let .inconsistentExport(message):
+            return "Fetcher contract export failed integrity validation: \(message)"
         }
     }
 }
@@ -93,6 +97,13 @@ struct FetcherContractLoader {
     /// Navidrome song identity; retain v1 as a decode fallback.
     static let sourceAttributionFilename = "source-attribution.json"
     static let sourceAttributionV2Filename = "source-attribution-v2.json"
+    static let sourceAttributionV3Filename = "source-attribution-v3.json"
+
+    struct ProvenanceBundle: Sendable {
+        let metadata: FetcherContractMetadata
+        let collections: [FetcherSourceCollection]
+        let attribution: [FetcherSourceAttribution]
+    }
 
     var fileManager: FileManager = .default
 
@@ -219,6 +230,10 @@ struct FetcherContractLoader {
             contractHealth: try decode([FetcherContractHealthRow].self, filename: "contract-health.json", directory: directory),
             sourceAttribution: try decodeOptional(
                 [FetcherSourceAttribution].self,
+                filename: Self.sourceAttributionV3Filename,
+                directory: directory
+            ) ?? decodeOptional(
+                [FetcherSourceAttribution].self,
                 filename: Self.sourceAttributionV2Filename,
                 directory: directory
             ) ?? decodeOptional(
@@ -227,6 +242,90 @@ struct FetcherContractLoader {
                 directory: directory
             ) ?? []
         )
+    }
+
+    /// Minimal read for durable background provenance import.  The Sources UI
+    /// still loads its full inspector snapshot separately.
+    func loadProvenanceBundle(from directory: URL) throws -> ProvenanceBundle {
+        guard isReadableDirectory(directory) else { throw FetcherContractLoaderError.unreadableDirectory(directory.path) }
+        let metadata = try decode(FetcherContractMetadata.self, filename: "contract-version.json", directory: directory)
+        guard metadata.exportSchemaVersion == 1 else { throw FetcherContractLoaderError.unsupportedExportSchemaVersion(metadata.exportSchemaVersion) }
+        guard (1...2).contains(metadata.fetcherContractVersion) else { throw FetcherContractLoaderError.unsupportedContractVersion(metadata.fetcherContractVersion) }
+        let verified = try validatePublishedFiles(
+            metadata: metadata,
+            filenames: ["source-collections.json", Self.sourceAttributionV3Filename, Self.sourceAttributionV2Filename, Self.sourceAttributionFilename],
+            directory: directory
+        )
+        let verifiedSnapshot: [String: Data]? = metadata.files.isEmpty ? nil : verified
+        let attribution = try decodeOptional([FetcherSourceAttribution].self, filename: Self.sourceAttributionV3Filename, directory: directory, verifiedData: verifiedSnapshot)
+            ?? decodeOptional([FetcherSourceAttribution].self, filename: Self.sourceAttributionV2Filename, directory: directory, verifiedData: verifiedSnapshot)
+            ?? decodeOptional([FetcherSourceAttribution].self, filename: Self.sourceAttributionFilename, directory: directory, verifiedData: verifiedSnapshot)
+            ?? []
+        if !metadata.files.isEmpty, verified["source-collections.json"] == nil {
+            throw FetcherContractLoaderError.missingFile("source-collections.json")
+        }
+        return ProvenanceBundle(
+            metadata: metadata,
+            collections: try decode([FetcherSourceCollection].self, data: verified["source-collections.json"] ?? Data(contentsOf: directory.appendingPathComponent("source-collections.json"))),
+            attribution: attribution
+        )
+    }
+
+    func loadMetadata(from directory: URL) throws -> FetcherContractMetadata {
+        guard isReadableDirectory(directory) else { throw FetcherContractLoaderError.unreadableDirectory(directory.path) }
+        let metadata = try decode(FetcherContractMetadata.self, filename: "contract-version.json", directory: directory)
+        guard metadata.exportSchemaVersion == 1 else { throw FetcherContractLoaderError.unsupportedExportSchemaVersion(metadata.exportSchemaVersion) }
+        guard (1...2).contains(metadata.fetcherContractVersion) else { throw FetcherContractLoaderError.unsupportedContractVersion(metadata.fetcherContractVersion) }
+        return metadata
+    }
+
+    func loadSourceCollections(from directory: URL) throws -> [FetcherSourceCollection] {
+        try decode([FetcherSourceCollection].self, filename: "source-collections.json", directory: directory)
+    }
+
+    /// The importer uses this lightweight path after facts are known-current.
+    /// It still verifies the publication hash before project writes.
+    func loadValidatedSourceCollections(from directory: URL, metadata: FetcherContractMetadata) throws -> [FetcherSourceCollection] {
+        let verified = try validatePublishedFiles(metadata: metadata, filenames: ["source-collections.json"], directory: directory)
+        if !metadata.files.isEmpty, verified["source-collections.json"] == nil {
+            throw FetcherContractLoaderError.missingFile("source-collections.json")
+        }
+        return try decode([FetcherSourceCollection].self, data: verified["source-collections.json"] ?? Data(contentsOf: directory.appendingPathComponent("source-collections.json")))
+    }
+
+    /// Read an owned snapshot and verify it before any importer writes. A file
+    /// declared in the publication cannot disappear into a silent legacy fallback.
+    private func validatePublishedFiles(metadata: FetcherContractMetadata, filenames: [String], directory: URL) throws -> [String: Data] {
+        guard !metadata.files.isEmpty else { return [:] }
+        var summaries: [String: String] = [:]
+        for summary in metadata.files {
+            guard summaries[summary.path] == nil else {
+                throw FetcherContractLoaderError.inconsistentExport("duplicate metadata entry for \(summary.path)")
+            }
+            summaries[summary.path] = summary.contentHash
+        }
+        var verified: [String: Data] = [:]
+        for filename in filenames {
+            let url = directory.appendingPathComponent(filename)
+            guard fileManager.fileExists(atPath: url.path) else {
+                if summaries[filename] != nil { throw FetcherContractLoaderError.missingFile(filename) }
+                continue
+            }
+            guard let expected = summaries[filename] else {
+                throw FetcherContractLoaderError.inconsistentExport("metadata has no hash for \(filename)")
+            }
+            // Do not memory-map: an in-place publisher write must not alter
+            // bytes between checksum verification and JSON decoding.
+            let data = try Data(contentsOf: url)
+            let digest = SHA256.hash(data: data)
+                .map { String(format: "%02x", $0) }
+                .joined()
+            guard expected == "sha256:\(digest)" else {
+                throw FetcherContractLoaderError.inconsistentExport("hash mismatch for \(filename)")
+            }
+            verified[filename] = data
+        }
+        return verified
     }
 
     func configuredDirectory(defaults: UserDefaults = .standard, environment: [String: String] = ProcessInfo.processInfo.environment) -> URL? {
@@ -249,9 +348,17 @@ struct FetcherContractLoader {
         return try JSONDecoder().decode(type, from: data)
     }
 
+    private func decode<T: Decodable>(_ type: T.Type, data: Data) throws -> T {
+        try JSONDecoder().decode(type, from: data)
+    }
+
     /// Decodes an optional export file, returning `nil` when the file is absent.
     /// A present-but-malformed file still throws (a broken export should surface).
-    private func decodeOptional<T: Decodable>(_ type: T.Type, filename: String, directory: URL) throws -> T? {
+    private func decodeOptional<T: Decodable>(_ type: T.Type, filename: String, directory: URL, verifiedData: [String: Data]? = nil) throws -> T? {
+        if let verifiedData {
+            guard let data = verifiedData[filename] else { return nil }
+            return try JSONDecoder().decode(type, from: data)
+        }
         let url = directory.appendingPathComponent(filename)
         guard fileManager.fileExists(atPath: url.path) else { return nil }
         let data = try Data(contentsOf: url, options: .mappedIfSafe)
@@ -305,6 +412,10 @@ private extension URL {
 enum FetcherContractSettings {
     static let isEnabledKey = "enableFetcherSourceBrowser"
     static let fixtureDirectoryKey = "fetcherContractFixtureDirectory"
+
+    /// The showcase build ships without the Sources browser, so the app
+    /// never reads a Fetcher export at runtime.
+    static var isEnabled: Bool { false }
 }
 
 enum FetcherCandidateRoute: String, Sendable {
