@@ -5,6 +5,7 @@
 ## Hello, human
 
 There's a need for a middle ground between the boomer media hoarder and the zoomer stream it all. This software is supposed to be meeting my needs for that, specifically letting me amass my hoard but also, there was a hope it was help me chunk through it. As of now, that part of the design has failed. Otherwise, its a pretty good navidrome client that looks and feels like Apple music. Chop it up as needed 
+
 ---
 
 *The rest of this README was written by an AI model (Claude Opus 5.5) from the code in this repository.*
