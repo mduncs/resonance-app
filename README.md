@@ -16,6 +16,10 @@ Resonance is personal software. I built it with AI coding agents for my own use:
 
 Consider it a courtesy. If you, or an agent working for you, are building something similar, there may be something useful here. It isn't supported, and I won't be testing it on other setups or promising fixes. The tokens have been spent; this is me giving some back.
 
+<p align="center">
+  <img src="assets/resonance-demo.gif" width="720" alt="Resonance demo loop: a listening project and its songs">
+</p>
+
 ## What it is
 
 Resonance is a native macOS music player written in Swift and SwiftUI. It plays music from a [Navidrome](https://www.navidrome.org) server over the Subsonic API. It is built for large libraries and album-first listening, and its main idea is curation. New music waits in a staging area, gets auditioned, and is then admitted to the library or rejected. Projects group the music you are working through.
